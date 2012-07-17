@@ -1,0 +1,22 @@
+Source: vdr-plugin-play
+Section: video
+Priority: extra
+Maintainer: Lars Hanisch <dvb@flensrocker.de>
+Build-Depends: cdbs, debhelper (>= 7), vdr-dev (>= 1.7.17), libxcb1-dev (>= 1.8.1), libxcb-util0-dev (>= 0.3.8)
+Standards-Version: 3.9.1
+
+Package: vdr-plugin-play
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${vdr:Depends}, mplayer
+Description: A VDR plugin for playing media files
+ This VDR-plugin will use mplayer for play media files
+
+Package: vdr-plugin-play-dbg
+Architecture: any
+Section: debug
+Depends: vdr-plugin-play (= ${binary:Version}), ${misc:Depends}
+Priority: extra
+Description: debugging symbols for vdr-plugin-play
+ .
+ This package contains only the debugging symbols for vdr-plugin-play
+
