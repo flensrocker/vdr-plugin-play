@@ -37,7 +37,7 @@
     /// vdr-plugin version number.
     /// Makefile extracts the version number for generating the file name
     /// for the distribution archive.
-static const char *const VERSION = "0.0.6"
+static const char *const VERSION = "0.0.7"
 #ifdef GIT_REV
     "-GIT" GIT_REV
 #endif
@@ -483,6 +483,13 @@ static int PipeOut[2];			///< player write pipe
 static int PipeIn[2];			///< player read pipe
 static char DvdNav;			///< dvdnav active
 static int PlayerVolume = -1;		///< volume 0 - 100
+static char PlayerPaused;		///< player paused
+static char PlayerSpeed;		///< player playback speed
+
+/*
+static enum __player_state_ {
+} PlayerState;				///< player state
+*/
 
 /**
 **	Poll input pipe.
@@ -572,8 +579,13 @@ void ExecPlayer(const char *filename)
 	args[10] = "-nograbpointer";
 	args[11] = "-noconsolecontrols";
 	args[12] = "-fixed-vo";
-	args[13] = "-nocache";		// dvdnav needs nocache
-	argn = 14;
+	argn = 13;
+	if (!strncasecmp(filename, "cdda://", 7)) {
+	    args[argn++] = "-cache";	// cdrom needs cache
+	    args[argn++] = "1000";
+	} else {
+	    args[argn++] = "-nocache";	// dvdnav needs nocache
+	}
 	if (ConfigUseSlave) {
 	    args[argn++] = "-slave";
 	    //args[argn++] = "-idle";
@@ -738,14 +750,314 @@ static void PlayerSendQuit(void)
 }
 
 /**
+**	Send player pause.
+*/
+static void PlayerSendPause(void)
+{
+    if (ConfigUseSlave) {
+	SendCommand("pause\n");
+    }
+}
+
+/**
+**	Send player speed_set.
+*/
+static void PlayerSendSetSpeed(int speed)
+{
+    if (ConfigUseSlave) {
+	SendCommand("pausing_keep speed_set %d\n", speed);
+    }
+}
+
+/**
+**	Send player seek.
+*/
+static void PlayerSendSeek(int seconds)
+{
+    if (ConfigUseSlave) {
+	SendCommand("pausing_keep seek %+d 0\n", seconds);
+    }
+}
+
+/**
 **	Send player volume.
 */
 static void PlayerSendVolume(void)
 {
     if (ConfigUseSlave) {
 	// FIXME: %.2f could have a problem with LANG
-	SendCommand("volume %.2f 1\n", (PlayerVolume * 100.0) / 255);
+	SendCommand("pausing_keep volume %.2f 1\n",
+	    (PlayerVolume * 100.0) / 255);
     }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//	Osd
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+**	Close OSD.
+*/
+static void OsdClose(void)
+{
+}
+
+/**
+**	Get OSD size.
+*/
+void GetOsdSize(int * w, int *h, double *a)
+{
+    *w = 1920;
+    *h = 1080;
+    *a = 1.0;
+}
+
+/**
+**	Draw osd pixmap
+*/
+void OsdDrawARGB(int x, int y, int w, int h, const uint8_t *argb)
+{
+    x = x;
+    y = y;
+    w = w;
+    h = h;
+    argb = argb;
+}
+
+/// C plugin get osd size and ascpect
+extern void GetOsdSize(int *, int *, double *);
+
+/// C plugin close osd
+extern void OsdClose(void);
+/// C plugin draw osd pixmap
+extern void OsdDrawARGB(int, int, int, int, const uint8_t *);
+
+//////////////////////////////////////////////////////////////////////////////
+//	cOsd
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+**	My device plugin OSD class.
+*/
+class cMyOsd:public cOsd
+{
+  public:
+    static volatile char Dirty;		///< flag force redraw everything
+
+     cMyOsd(int, int, uint);		///< constructor
+     virtual ~ cMyOsd(void);		///< destructor
+    virtual void Flush(void);		///< commits all data to the hardware
+    virtual void SetActive(bool);	///< sets OSD to be the active one
+};
+
+volatile char cMyOsd::Dirty;		///< flag force redraw everything
+
+/**
+**	Sets this OSD to be the active one.
+**
+**	@param on	true on, false off
+**
+**	@note only needed as workaround for text2skin plugin with
+**	undrawn areas.
+*/
+void cMyOsd::SetActive(bool on)
+{
+    Debug(3, "[play]%s: %d\n", __FUNCTION__, on);
+
+    if (Active() == on) {
+	return;				// already active, no action
+    }
+    cOsd::SetActive(on);
+    if (on) {
+	Dirty = 1;
+    } else {
+	OsdClose();
+    }
+}
+
+/**
+**	Constructor OSD.
+**
+**	Initializes the OSD with the given coordinates.
+**
+**	@param left	x-coordinate of osd on display
+**	@param top	y-coordinate of osd on display
+**	@param level	level of the osd (smallest is shown)
+*/
+cMyOsd::cMyOsd(int left, int top, uint level)
+:cOsd(left, top, level)
+{
+    /* FIXME: OsdWidth/OsdHeight not correct!
+       Debug(3, "[play]%s: %dx%d+%d+%d, %d\n", __FUNCTION__, OsdWidth(),
+       OsdHeight(), left, top, level);
+     */
+
+    SetActive(true);
+}
+
+/**
+**	OSD Destructor.
+**
+**	Shuts down the OSD.
+*/
+cMyOsd::~cMyOsd(void)
+{
+    Debug(3, "[play]%s:\n", __FUNCTION__);
+    SetActive(false);
+    // done by SetActive: OsdClose();
+}
+
+/**
+**	Actually commits all data to the OSD hardware.
+*/
+void cMyOsd::Flush(void)
+{
+    cPixmapMemory *pm;
+
+    if (!Active()) {
+	return;
+    }
+
+    if (!IsTrueColor()) {		// work bitmap
+	cBitmap *bitmap;
+	int i;
+
+	// draw all bitmaps
+	for (i = 0; (bitmap = GetBitmap(i)); ++i) {
+	    uint8_t *argb;
+	    int x;
+	    int y;
+	    int w;
+	    int h;
+	    int x1;
+	    int y1;
+	    int x2;
+	    int y2;
+
+	    // get dirty bounding box
+	    if (Dirty) {		// forced complete update
+		x1 = 0;
+		y1 = 0;
+		x2 = bitmap->Width() - 1;
+		y2 = bitmap->Height() - 1;
+	    } else if (!bitmap->Dirty(x1, y1, x2, y2)) {
+		continue;		// nothing dirty continue
+	    }
+	    // convert and upload only dirty areas
+	    w = x2 - x1 + 1;
+	    h = y2 - y1 + 1;
+	    if (1) {			// just for the case it makes trouble
+		int width;
+		int height;
+		double video_aspect;
+
+		::GetOsdSize(&width, &height, &video_aspect);
+		if (w > width) {
+		    w = width;
+		    x2 = x1 + width - 1;
+		}
+		if (h > height) {
+		    h = height;
+		    y2 = y1 + height - 1;
+		}
+	    }
+#ifdef DEBUG
+	    if (w > bitmap->Width() || h > bitmap->Height()) {
+		esyslog(tr("[play]: dirty area too big\n"));
+		abort();
+	    }
+#endif
+	    argb = (uint8_t *) malloc(w * h * sizeof(uint32_t));
+	    for (y = y1; y <= y2; ++y) {
+		for (x = x1; x <= x2; ++x) {
+		    ((uint32_t *) argb)[x - x1 + (y - y1) * w] =
+			bitmap->GetColor(x, y);
+		}
+	    }
+	    OsdDrawARGB(Left() + bitmap->X0() + x1, Top() + bitmap->Y0() + y1,
+		w, h, argb);
+
+	    bitmap->Clean();
+	    // FIXME: reuse argb
+	    free(argb);
+	}
+	cMyOsd::Dirty = 0;
+	return;
+    }
+
+    LOCK_PIXMAPS;
+    while ((pm = RenderPixmaps())) {
+	int x;
+	int y;
+	int w;
+	int h;
+
+	x = Left() + pm->ViewPort().X();
+	y = Top() + pm->ViewPort().Y();
+	w = pm->ViewPort().Width();
+	h = pm->ViewPort().Height();
+
+	/*
+	   Debug(3, "[play]%s: draw %dx%d+%d+%d %p\n", __FUNCTION__, w, h,
+	   x, y, pm->Data());
+	 */
+
+	OsdDrawARGB(x, y, w, h, pm->Data());
+
+	delete pm;
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+//	cOsdProvider
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+**	My device plugin OSD provider class.
+*/
+class cMyOsdProvider:public cOsdProvider
+{
+  private:
+    static cOsd *Osd;
+  public:
+    virtual cOsd * CreateOsd(int, int, uint);
+    virtual bool ProvidesTrueColor(void);
+    cMyOsdProvider(void);
+};
+
+cOsd *cMyOsdProvider::Osd;		///< single osd
+
+/**
+**	Create a new OSD.
+**
+**	@param left	x-coordinate of OSD
+**	@param top	y-coordinate of OSD
+**	@param level	layer level of OSD
+*/
+cOsd *cMyOsdProvider::CreateOsd(int left, int top, uint level)
+{
+    Debug(3, "[play]%s: %d, %d, %d\n", __FUNCTION__, left, top, level);
+
+    return Osd = new cMyOsd(left, top, level);
+}
+
+/**
+**	Check if this OSD provider is able to handle a true color OSD.
+**
+**	@returns true we are able to handle a true color OSD.
+*/
+bool cMyOsdProvider::ProvidesTrueColor(void)
+{
+    return true;
+}
+
+/**
+**	Create cOsdProvider class.
+*/
+cMyOsdProvider::cMyOsdProvider(void)
+:  cOsdProvider()
+{
+    Debug(3, "[play]%s:\n", __FUNCTION__);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -775,6 +1087,9 @@ cMyPlayer::cMyPlayer(const char *filename)
     PipeIn[0] = -1;
     PipeOut[1] = -1;
     PlayerPid = 0;
+
+    PlayerPaused = 0;
+    PlayerSpeed = 1;
 
     PlayerVolume = cDevice::CurrentVolume();
     Debug(3, "play: initial volume %d\n", PlayerVolume);
@@ -833,6 +1148,7 @@ void cMyPlayer::Activate(bool on)
     if (on) {
 	if (ConfigOsdOverlay) {
 	    VideoInit();
+	    new cMyOsdProvider();
 	}
 	ExecPlayer(FileName);
 	return;
@@ -959,7 +1275,39 @@ eOSState cMyControl::ProcessKey(eKeys key)
     switch (key) {
 	case kUp:
 	    if (DvdNav) {
+	    }
+	case kPlay:
+	    if (PlayerSpeed != 1) {
+		PlayerSendSetSpeed(PlayerSpeed = 1);
 	    } else {
+		PlayerSendPause();
+		PlayerPaused ^= 1;
+	    }
+	    break;
+
+	case kDown:
+	    if (DvdNav) {
+	    }
+	case kStop:
+	    Hide();
+	    PlayerSendPause();
+	    PlayerPaused ^= 1;
+	    break;
+
+	case kLeft:
+	    if (DvdNav) {
+	    }
+	    if ( PlayerSpeed > 1 ) {
+		PlayerSendSetSpeed(PlayerSpeed /= 2);
+	    } else {
+		PlayerSendSeek(-10);
+	    }
+	    break;
+	case kRight:
+	    if (DvdNav) {
+	    }
+	    if ( PlayerSpeed < 32 ) {
+		PlayerSendSetSpeed(PlayerSpeed *= 2);
 	    }
 	    break;
 
@@ -968,10 +1316,6 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	    // FIXME: need to select old directory and index
 	    cRemote::CallPlugin("play");
 	    return osBack;
-	case kStop:
-	    Hide();
-	    //Stop();
-	    return osEnd;
 	default:
 	    break;
     }
@@ -1071,6 +1415,7 @@ static const NameFilter VideoFilters[] = {
     FILTER(".vob"),
     FILTER(".wmv"),
 #undef FILTER
+    { 0, NULL }
 };
 
 /**
@@ -1083,6 +1428,7 @@ static const NameFilter AudioFilters[] = {
     FILTER(".ogg"),
     FILTER(".wav"),
 #undef FILTER
+    { 0, NULL }
 };
 
 /**
@@ -1189,7 +1535,7 @@ eOSState cMyMenu::ProcessKey(eKeys key)
 
     // call standard function
     state = cOsdMenu::ProcessKey(key);
-    dsyslog("[play]%s: %x - %x\n", __FUNCTION__, state, key);
+    Debug(3, "[play]%s: %x - %x\n", __FUNCTION__, state, key);
 
     switch (state) {
 	case osUnknown:
@@ -1224,14 +1570,15 @@ eOSState cMyMenu::ProcessKey(eKeys key)
 			    free(filename);
 			    return osEnd;
 			}
-			if (!strcmp(text, "VIDEO_TS")) {
+			// handle DVD image
+			if (!strcmp(text, "AUDIO_TS")
+				|| !strcmp(text, "VIDEO_TS")) {
 			    char *tmp;
 
-			    tmp =
-				(char *)malloc(strlen(filename) +
-				sizeof("dvdnav:///"));
-			    strcpy(stpcpy(tmp, "dvdnav:///"), filename);
 			    free(filename);
+			    tmp = (char *)malloc(sizeof("dvdnav:///")
+				+ strlen(Path));
+			    strcpy(stpcpy(tmp, "dvdnav:///"), Path);
 			    PlayFile(tmp);
 			    free(tmp);
 			    return osEnd;
@@ -1304,7 +1651,7 @@ eOSState cPlayMenu::ProcessKey(eKeys key)
 {
     eOSState state;
 
-    dsyslog("[play]%s: %x\n", __FUNCTION__, key);
+    Debug(3, "[play]%s: %x\n", __FUNCTION__, key);
 
     // call standard function
     state = cOsdMenu::ProcessKey(key);
@@ -1343,6 +1690,50 @@ eOSState cPlayMenu::ProcessKey(eKeys key)
     return state;
 }
 
+#if 0
+
+//////////////////////////////////////////////////////////////////////////////
+//	cDevice
+//////////////////////////////////////////////////////////////////////////////
+
+class cMyDevice:public cDevice
+{
+  public:
+    cMyDevice(void);
+    virtual ~ cMyDevice(void);
+
+    virtual void GetOsdSize(int &, int &, double &);
+  protected:
+    virtual void MakePrimaryDevice(bool);
+};
+
+cMyDevice::cMyDevice(void)
+{
+    Debug(3, "[play]%s\n", __FUNCTION__);
+}
+
+cMyDevice::~cMyDevice(void)
+{
+    Debug(3, "[play]%s:\n", __FUNCTION__);
+}
+
+/**
+**	Informs a device that it will be the primary device.
+**
+**	@param on	flag if becoming or loosing primary
+*/
+void cMyDevice::MakePrimaryDevice(bool on)
+{
+    Debug(3, "[play]%s: %d\n", __FUNCTION__, on);
+
+    cDevice::MakePrimaryDevice(on);
+    if (on) {
+	new cMyOsdProvider();
+    }
+}
+
+#endif
+
 //////////////////////////////////////////////////////////////////////////////
 //	cPlugin
 //////////////////////////////////////////////////////////////////////////////
@@ -1372,13 +1763,13 @@ cMyPlugin::cMyPlugin(void)
     // Initialize any member variables here.
     // DON'T DO ANYTHING ELSE THAT MAY HAVE SIDE EFFECTS, REQUIRE GLOBAL
     // VDR OBJECTS TO EXIST OR PRODUCE ANY OUTPUT!
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 }
 
 cMyPlugin::~cMyPlugin(void)
 {
     // Clean up after yourself!
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 }
 
 /**
@@ -1420,7 +1811,7 @@ bool cMyPlugin::ProcessArgs(int argc, char *argv[])
 */
 bool cMyPlugin::Initialize(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 
     // FIXME: can delay until needed?
     //Status = new cMyStatus;		// start monitoring
@@ -1434,7 +1825,7 @@ bool cMyPlugin::Initialize(void)
 */
 bool cMyPlugin::Start(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 
     return true;
 }
@@ -1445,7 +1836,7 @@ bool cMyPlugin::Start(void)
 */
 void cMyPlugin::Stop(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 }
 
 /**
@@ -1453,7 +1844,7 @@ void cMyPlugin::Stop(void)
 */
 void cMyPlugin::Housekeeping(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 }
 
 #endif
@@ -1463,7 +1854,7 @@ void cMyPlugin::Housekeeping(void)
 */
 const char *cMyPlugin::MainMenuEntry(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 
     return ConfigHideMainMenuEntry ? NULL : tr(MAINMENUENTRY);
 }
@@ -1473,7 +1864,7 @@ const char *cMyPlugin::MainMenuEntry(void)
 */
 cOsdObject *cMyPlugin::MainMenuAction(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 
     if (ShowBrowser) {
 	return new cMyMenu("Browse", BrowserStartDir, BrowserFilters);
@@ -1489,7 +1880,7 @@ cOsdObject *cMyPlugin::MainMenuAction(void)
 */
 void cMyPlugin::MainThreadHook(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 
     //::MainThreadHook();
 }
@@ -1501,7 +1892,7 @@ void cMyPlugin::MainThreadHook(void)
 */
 cMenuSetupPage *cMyPlugin::SetupMenu(void)
 {
-    //dsyslog("[play]%s:\n", __FUNCTION__);
+    //Debug(3, "[play]%s:\n", __FUNCTION__);
 
     return new cMyMenuSetupPage;
 }
@@ -1516,7 +1907,7 @@ cMenuSetupPage *cMyPlugin::SetupMenu(void)
 */
 bool cMyPlugin::SetupParse(const char *name, const char *value)
 {
-    //dsyslog("[play]%s: '%s' = '%s'\n", __FUNCTION__, name, value);
+    //Debug(3, "[play]%s: '%s' = '%s'\n", __FUNCTION__, name, value);
 
     if (!strcasecmp(name, "HideMainMenuEntry")) {
 	ConfigHideMainMenuEntry = atoi(value);
