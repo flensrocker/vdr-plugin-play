@@ -1,3 +1,9 @@
+vdr-plugin-play (0.0.7-1yavdr0~precise) precise; urgency=medium
+
+  * add pkg-config to build dependencies
+
+ -- Lars Hanisch <dvb@flensrocker.de>  Tue, 17 Jul 2012 21:15:08 +0200
+
 vdr-plugin-play (0.0.7-0yavdr0~precise) precise; urgency=medium
 
   * new upstream version
