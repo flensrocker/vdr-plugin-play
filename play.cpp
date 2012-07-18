@@ -37,7 +37,7 @@
     /// vdr-plugin version number.
     /// Makefile extracts the version number for generating the file name
     /// for the distribution archive.
-static const char *const VERSION = "0.0.7"
+static const char *const VERSION = "0.0.8"
 #ifdef GIT_REV
     "-GIT" GIT_REV
 #endif
@@ -73,10 +73,13 @@ static const char *ConfigX11Display = ":0.0";	///< x11 display
 //////////////////////////////////////////////////////////////////////////////
 
 #include <xcb/xcb.h>
+#include <xcb/xcb_image.h>
+#include <xcb/xcb_pixel.h>
 
 static xcb_connection_t *Connection;	///< xcb connection
 static xcb_colormap_t VideoColormap;	///< video colormap
-static xcb_window_t VideoWindow;	///< video window
+static xcb_window_t VideoOsdWindow;	///< video osd window
+static xcb_window_t VideoPlayWindow;	///< video player window
 static xcb_screen_t const *VideoScreen;	///< video screen
 static uint32_t VideoBlankTick;		///< blank cursor timer
 static xcb_cursor_t VideoBlankCursor;	///< empty invisible cursor
@@ -87,18 +90,17 @@ static unsigned VideoWindowWidth;	///< video output window width
 static unsigned VideoWindowHeight;	///< video output window height
 
 ///
-///	Create main window.
+///	Create X11 window.
 ///
 ///	@param parent	parent of new window
 ///	@param visual	visual of parent
 ///	@param depth	depth of parent
 ///
-static void VideoCreateWindow(xcb_window_t parent, xcb_visualid_t visual,
+static xcb_window_t VideoCreateWindow(xcb_window_t parent, xcb_visualid_t visual,
     uint8_t depth)
 {
     uint32_t values[4];
-    xcb_pixmap_t pixmap;
-    xcb_cursor_t cursor;
+    xcb_window_t window;
 
     Debug(3, "video: visual %#0x depth %d\n", visual, depth);
 
@@ -115,8 +117,8 @@ static void VideoCreateWindow(xcb_window_t parent, xcb_visualid_t visual,
 	XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_EXPOSURE |
 	XCB_EVENT_MASK_STRUCTURE_NOTIFY;
     values[3] = VideoColormap;
-    VideoWindow = xcb_generate_id(Connection);
-    xcb_create_window(Connection, depth, VideoWindow, parent, VideoWindowX,
+    window = xcb_generate_id(Connection);
+    xcb_create_window(Connection, depth, window, parent, VideoWindowX,
 	VideoWindowY, VideoWindowWidth, VideoWindowHeight, 0,
 	XCB_WINDOW_CLASS_INPUT_OUTPUT, visual,
 	XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK |
@@ -125,38 +127,280 @@ static void VideoCreateWindow(xcb_window_t parent, xcb_visualid_t visual,
     // define only available with xcb-utils-0.3.8
 #ifdef XCB_ICCCM_NUM_WM_SIZE_HINTS_ELEMENTS
     // FIXME: utf _NET_WM_NAME
-    xcb_icccm_set_wm_name(Connection, VideoWindow, XCB_ATOM_STRING, 8,
+    xcb_icccm_set_wm_name(Connection, window, XCB_ATOM_STRING, 8,
 	sizeof("play control") - 1, "play control");
-    xcb_icccm_set_wm_icon_name(Connection, VideoWindow, XCB_ATOM_STRING, 8,
+    xcb_icccm_set_wm_icon_name(Connection, window, XCB_ATOM_STRING, 8,
 	sizeof("play control") - 1, "play control");
 #endif
     // define only available with xcb-utils-0.3.6
 #ifdef XCB_NUM_WM_HINTS_ELEMENTS
     // FIXME: utf _NET_WM_NAME
-    xcb_set_wm_name(Connection, VideoWindow, XCB_ATOM_STRING,
+    xcb_set_wm_name(Connection, window, XCB_ATOM_STRING,
 	sizeof("play control") - 1, "play control");
-    xcb_set_wm_icon_name(Connection, VideoWindow, XCB_ATOM_STRING,
+    xcb_set_wm_icon_name(Connection, window, XCB_ATOM_STRING,
 	sizeof("play control") - 1, "play control");
 #endif
 
     // FIXME: size hints
-    xcb_map_window(Connection, VideoWindow);
+
+    // window above parent
+    values[0] = parent;
+    values[1] = XCB_STACK_MODE_ABOVE;
+    xcb_configure_window(Connection, window,
+	XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE, values);
+
+    xcb_map_window(Connection, window);
 
     //
     //	hide cursor
     //
-    pixmap = xcb_generate_id(Connection);
-    xcb_create_pixmap(Connection, 1, pixmap, parent, 1, 1);
-    cursor = xcb_generate_id(Connection);
-    xcb_create_cursor(Connection, cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 1,
-	1);
+    if ( VideoBlankCursor == XCB_NONE ) {
+	xcb_pixmap_t pixmap;
+	xcb_cursor_t cursor;
 
-    values[0] = cursor;
-    xcb_change_window_attributes(Connection, VideoWindow, XCB_CW_CURSOR,
-	values);
-    VideoBlankCursor = cursor;
-    VideoBlankTick = 0;
+	pixmap = xcb_generate_id(Connection);
+	xcb_create_pixmap(Connection, 1, pixmap, parent, 1, 1);
+	cursor = xcb_generate_id(Connection);
+	xcb_create_cursor(Connection, cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 1,
+	    1);
+	VideoBlankCursor = cursor;
+	VideoBlankTick = 0;
+    }
+
+    values[0] = VideoBlankCursor;
+    xcb_change_window_attributes(Connection, window, XCB_CW_CURSOR, values);
     // FIXME: free colormap/cursor/pixmap needed?
+
+    return window;
+}
+
+///
+///	Draw a ARGB image.
+///
+static void VideoDrawARGB(int x, int y, int width, int height,
+    const uint8_t *argb)
+{
+    xcb_image_t *xcb_image;
+    xcb_gcontext_t gc;
+    int sx;
+    int sy;
+
+    if (!Connection) {
+	Debug(3, "play: FIXME: must restore osd provider\n");
+	return;
+    }
+
+    gc = xcb_generate_id(Connection);
+    xcb_create_gc(Connection, gc, VideoOsdWindow, 0, NULL);
+
+    xcb_image = xcb_image_create_native(Connection, width, height,
+	XCB_IMAGE_FORMAT_Z_PIXMAP, VideoScreen->root_depth, NULL, 0L, NULL);
+
+    //  fast 32it versions
+    if (xcb_image->bpp == 32) {
+	if (xcb_image->byte_order == XCB_IMAGE_ORDER_LSB_FIRST) {
+	    for ( sy=0; sy<height; ++sy) {
+		for ( sx=0; sx<width; ++sx) {
+		    uint32_t pixel;
+
+		    if (argb[(width * sy + sx) * 4 + 3] < 200) {
+			pixel = 0xFF020507;
+		    } else {
+			pixel = argb[(width * sy + sx) *4 + 0] << 0;
+			pixel |= argb[(width * sy + sx) *4 + 1] << 8;
+			pixel |= argb[(width * sy + sx) *4 + 2] << 16;
+		    }			
+		    xcb_image_put_pixel_Z32L(xcb_image, sx, sy, pixel);
+		}
+	    }
+	} else {
+	    Error(tr("play: unsupported put_image\n"));
+	}
+    } else {
+	for ( sy=0; sy<height; ++sy) {
+	    for ( sx=0; sx<width; ++sx) {
+		uint32_t pixel;
+
+		    if (argb[(width * sy + sx) * 4 + 3] < 200) {
+			pixel = argb[(width * sy + sx) *4 + 3] << 0;
+			pixel |= argb[(width * sy + sx) *4 + 3] << 8;
+			pixel |= argb[(width * sy + sx) *4 + 3] << 16;
+		    } else {
+			pixel = argb[(width * sy + sx) *4 + 0] << 0;
+			pixel |= argb[(width * sy + sx) *4 + 1] << 8;
+			pixel |= argb[(width * sy + sx) *4 + 2] << 16;
+		    }			
+		xcb_image_put_pixel(xcb_image, sx, sy, pixel);
+	    }
+	}
+    }
+
+    // render xcb_image to color data pixmap
+    xcb_image_put(Connection, VideoOsdWindow, gc, xcb_image, x, y, 0);
+    // release xcb_image
+    xcb_image_destroy(xcb_image);
+    xcb_free_gc(Connection, gc);
+    xcb_flush(Connection);
+}
+
+#if 0
+static ScaledIcon *IconGetScaled(Icon * icon, int width, int height)
+{
+    ScaledIcon *scaled;
+    xcb_image_t *xcb_image;
+    int x;
+    int y;
+    int i;
+    int n;
+    double scale_x;
+    double scale_y;
+    double src_x;
+    double src_y;
+    uint8_t *argb;
+    uint8_t *mask;
+    int mask_width;
+
+    // calculated scaled icon size
+    if (!width) {
+	width = icon->Image->Width;
+    }
+    if (!height) {
+	height = icon->Image->Height;
+    }
+    Debug(4, "icon %dx%d -> %dx%d\n", icon->Image->Width, icon->Image->Height,
+	width, height);
+
+    // keep icon aspect ratio
+    i = (icon->Image->Width * 65536) / icon->Image->Height;
+    width = MIN(width * 65536, height * i);
+    height = MIN(height, width / i);
+    width = (height * i) / 65536;
+    if (width < 1) {
+	width = 1;
+    }
+    if (height < 1) {
+	height = 1;
+    }
+    // check if this size already exists
+    SLIST_FOREACH(scaled, &icon->Scaled, Next) {
+	if (scaled->Width == width && scaled->Height == height) {
+	    return scaled;
+	}
+    }
+
+    // see if we can use XCB render to create icon
+    if ((scaled = IconCreateRenderScaled(icon, width, height))) {
+	return scaled;
+    }
+
+    Debug(3, "new scaled icon from %dx%d\n", width, height);
+    // create a new ScaledIcon old-fashioned way
+    scaled = malloc(sizeof(*scaled));
+    SLIST_INSERT_HEAD(&icon->Scaled, scaled, Next);
+    scaled->Width = width;
+    scaled->Height = height;
+
+    // determine, if we need a mask, alpha > 128!
+    mask = NULL;
+    mask_width = (width + 7) / 8;	// moved out of if, to make gcc happy
+    n = 4 * icon->Image->Height * icon->Image->Width;
+    for (i = 0; i < n; i += 4) {
+	if (icon->Image->Data[i] < 128) {
+	    //
+	    //	allocate empty mask (if mask is needed)
+	    //
+	    i = mask_width * height;
+	    if ((mask = malloc(i))) {	// malloc success
+		memset(mask, 255, i);
+	    }
+	    break;
+	}
+    }
+
+    // create a temporary xcb_image for scaling
+    xcb_image =
+	xcb_image_create_native(Connection, width, height,
+	(XcbScreen->root_depth ==
+	    1) ? XCB_IMAGE_FORMAT_XY_BITMAP : XCB_IMAGE_FORMAT_Z_PIXMAP,
+	XcbScreen->root_depth, NULL, 0L, NULL);
+
+    // determine scale factor
+    // FIXME: remove doubles
+    scale_x = (double)icon->Image->Width / width;
+    scale_y = (double)icon->Image->Height / height;
+
+    argb = icon->Image->Data;
+    src_y = 0.0;
+    for (y = 0; y < height; y++) {
+	src_x = 0.0;
+	n = (int)src_y *icon->Image->Width;
+
+	for (x = 0; x < width; x++) {
+	    xcb_coloritem_t color;
+
+	    i = 4 * (n + (int)src_x);
+
+	    if (argb[i] < 128) {
+		mask[(y * mask_width) + (x >> 3)] &= (~(1 << (x & 7)));
+	    }
+
+	    color.red = (65535 * (argb[i + 1]) / 255);
+	    color.green = (65535 * (argb[i + 2]) / 255);
+	    color.blue = (65535 * (argb[i + 3]) / 255);
+	    ColorGetPixel(&color);
+
+	    // FIXME: use fast put pixel
+	    xcb_image_put_pixel(xcb_image, x, y, color.pixel);
+
+	    src_x += scale_x;
+	}
+
+	src_y += scale_y;
+    }
+
+    // create color data pixmap
+    scaled->Image.Pixmap = xcb_generate_id(Connection);
+    xcb_create_pixmap(Connection, XcbScreen->root_depth, scaled->Image.Pixmap,
+	XcbScreen->root, width, height);
+    // render xcb_image to color data pixmap
+    xcb_image_put(Connection, scaled->Image.Pixmap, RootGC, xcb_image, 0, 0,
+	0);
+    // release xcb_image
+    xcb_image_destroy(xcb_image);
+
+    scaled->Mask.Pixmap = XCB_NONE;
+    if (mask) {
+	scaled->Mask.Pixmap =
+	    xcb_create_pixmap_from_bitmap_data(Connection, XcbScreen->root,
+	    mask, width, height, 1, 0, 0, NULL);
+	free(mask);
+    }
+
+    return scaled;
+}
+#endif
+
+///
+///	Clear window.
+///
+void VideoWindowClear(void)
+{
+    if (!Connection) {
+	Debug(3, "play: FIXME: must restore osd provider\n");
+	return;
+    }
+    xcb_clear_area(Connection, 0, VideoOsdWindow, 0, 0, VideoWindowWidth,
+    	VideoWindowHeight);
+    xcb_flush(Connection);
+}
+
+///
+///	Set video geometry.
+///
+void VideoSetGeometry(const char* geometry)
+{
+    sscanf(geometry, "%dx%d%d%d", &VideoWindowWidth, &VideoWindowHeight,
+    	&VideoWindowX, &VideoWindowY);
 }
 
 ///
@@ -188,13 +432,26 @@ int VideoInit(void)
     }
     VideoScreen = iter.data;
 
-    VideoWindowX = 0;
-    VideoWindowY = 0;
-    VideoWindowWidth = 512;
-    VideoWindowHeight = 512;
+    //
+    //	Default window size
+    //
+    if (!VideoWindowHeight) {
+	if (VideoWindowWidth) {
+	    VideoWindowHeight = (VideoWindowWidth * 9) / 16;
+	} else {			// default to fullscreen
+	    VideoWindowHeight = VideoScreen->height_in_pixels;
+	    VideoWindowWidth = VideoScreen->width_in_pixels;
+	}
+    }
+    if (!VideoWindowWidth) {
+	VideoWindowWidth = (VideoWindowHeight * 16) / 9;
+    }
 
-    VideoCreateWindow(VideoScreen->root, VideoScreen->root_visual,
-	VideoScreen->root_depth);
+    VideoPlayWindow = VideoCreateWindow(VideoScreen->root,
+    	VideoScreen->root_visual, VideoScreen->root_depth);
+    VideoOsdWindow = VideoCreateWindow(VideoPlayWindow,
+	VideoScreen->root_visual, VideoScreen->root_depth);
+    Debug(3, "play: osd %x, play %x\n", VideoOsdWindow, VideoPlayWindow);
 
     xcb_flush(Connection);
 
@@ -206,9 +463,13 @@ int VideoInit(void)
 ///
 void VideoExit(void)
 {
-    if (VideoWindow != XCB_NONE) {
-	xcb_destroy_window(Connection, VideoWindow);
-	VideoWindow = XCB_NONE;
+    if (VideoOsdWindow != XCB_NONE) {
+	xcb_destroy_window(Connection, VideoOsdWindow);
+	VideoOsdWindow = XCB_NONE;
+    }
+    if (VideoPlayWindow != XCB_NONE) {
+	xcb_destroy_window(Connection, VideoPlayWindow);
+	VideoPlayWindow = XCB_NONE;
     }
     if (VideoColormap != XCB_NONE) {
 	xcb_free_colormap(Connection, VideoColormap);
@@ -400,6 +661,7 @@ extern "C"
 	    "  -a audio\tmplayer -ao (alsa:device=hw=0.0) overwrites mplayer.conf\n"
 	    "  -d display\tX11 display (default :0.0) overwrites $DISPLAY\n"
 	    "  -f\t\tmplayer fullscreen playback\n"
+	    "  -g\tgeometry\tx11 window geometry wxh+x+y\n"
 	    "  -m mplayer\tfilename of mplayer executable\n"
 	    "  -o\t\tosd overlay experiments\n" "  -s\t\tmplayer slave mode\n"
 	    "  -v video\tmplayer -vo (vdpau:deint=4,hqscaling=1) overwrites mplayer.conf\n";
@@ -429,7 +691,7 @@ extern "C"
 	}
 
 	for (;;) {
-	    switch (getopt(argc, argv, "-a:d:fm:osv:")) {
+	    switch (getopt(argc, argv, "-a:d:fg:m:osv:")) {
 		case 'a':		// audio out
 		    ConfigAudioOut = optarg;
 		    continue;
@@ -438,6 +700,9 @@ extern "C"
 		    continue;
 		case 'f':		// fullscreen mode
 		    ConfigFullscreen = 1;
+		    continue;
+		case 'g':		// geometry
+		    VideoSetGeometry(optarg);
 		    continue;
 		case 'm':		// mplayer executable
 		    ConfigMplayer = optarg;
@@ -546,6 +811,7 @@ void ExecPlayer(const char *filename)
     if (!pid) {				// child
 	const char *args[32];
 	int argn;
+	char wid_buf[32];
 	char volume_buf[32];
 	int i;
 
@@ -570,7 +836,11 @@ void ExecPlayer(const char *filename)
 	args[2] = "-msglevel";
 	// FIXME: play with the options
 	args[3] = "all=2:global=2:cplayer=2:identify=4";
-	args[4] = "-ontop";
+	if (VideoPlayWindow != XCB_NONE) {
+	    args[4] = "-noontop";
+	} else {
+	    args[4] = "-ontop";
+	}
 	args[5] = "-noborder";
 	args[6] = "-nolirc";
 	args[7] = "-nojoystick";	// disable all unwanted inputs
@@ -595,6 +865,11 @@ void ExecPlayer(const char *filename)
 	    args[argn++] = "-zoom";
 	} else {
 	    args[argn++] = "-nofs";
+	}
+	if (VideoPlayWindow != XCB_NONE) {
+	    snprintf(wid_buf, sizeof(wid_buf), "%d", VideoPlayWindow);
+	    args[argn++] = "-wid";
+	    args[argn++] = wid_buf;
 	}
 	if (ConfigVideoOut) {
 	    args[argn++] = "-vo";
@@ -800,6 +1075,9 @@ static void PlayerSendVolume(void)
 */
 static void OsdClose(void)
 {
+    Debug(3, "play: %s\n", __FUNCTION__);
+
+    VideoWindowClear();
 }
 
 /**
@@ -817,11 +1095,9 @@ void GetOsdSize(int * w, int *h, double *a)
 */
 void OsdDrawARGB(int x, int y, int w, int h, const uint8_t *argb)
 {
-    x = x;
-    y = y;
-    w = w;
-    h = h;
-    argb = argb;
+    Debug(3, "play: %s %d,%d %d,%d\n", __FUNCTION__, x, y, w, h);
+
+    VideoDrawARGB(x, y, w, h, argb);
 }
 
 /// C plugin get osd size and ascpect
@@ -1064,6 +1340,9 @@ cMyOsdProvider::cMyOsdProvider(void)
 //	cPlayer
 //////////////////////////////////////////////////////////////////////////////
 
+extern void CreateDummyDevice(void);
+extern void DestroyDummyDevice(void);
+
 class cMyPlayer:public cPlayer
 {
   private:
@@ -1132,6 +1411,7 @@ cMyPlayer::~cMyPlayer()
     PlayerPid = 0;
 
     if (ConfigOsdOverlay) {
+	DestroyDummyDevice();
 	VideoExit();
     }
     ClosePipes();
@@ -1143,12 +1423,12 @@ cMyPlayer::~cMyPlayer()
 */
 void cMyPlayer::Activate(bool on)
 {
-    printf("%s: '%s'\n", __FUNCTION__, FileName);
+    Debug(3, "[play]%s: '%s'\n", __FUNCTION__, FileName);
 
     if (on) {
 	if (ConfigOsdOverlay) {
 	    VideoInit();
-	    new cMyOsdProvider();
+	    CreateDummyDevice();
 	}
 	ExecPlayer(FileName);
 	return;
@@ -1237,7 +1517,7 @@ cMyControl::cMyControl(const char *filename)
 */
 cMyControl::~cMyControl()
 {
-    printf("%s\n", __FUNCTION__);
+    Debug(3, "%s\n", __FUNCTION__);
 
     delete Player;
     delete Display;
@@ -1249,12 +1529,12 @@ cMyControl::~cMyControl()
 
 void cMyControl::Hide(void)
 {
-    printf("%s:\n", __FUNCTION__);
+    Debug(3, "%s:\n", __FUNCTION__);
 }
 
 void cMyControl::Show(void)
 {
-    printf("%s:\n", __FUNCTION__);
+    Debug(3, "%s:\n", __FUNCTION__);
 }
 
 eOSState cMyControl::ProcessKey(eKeys key)
@@ -1279,7 +1559,8 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	case kPlay:
 	    if (PlayerSpeed != 1) {
 		PlayerSendSetSpeed(PlayerSpeed = 1);
-	    } else {
+	    }
+	    if (PlayerPaused) {
 		PlayerSendPause();
 		PlayerPaused ^= 1;
 	    }
@@ -1690,8 +1971,6 @@ eOSState cPlayMenu::ProcessKey(eKeys key)
     return state;
 }
 
-#if 0
-
 //////////////////////////////////////////////////////////////////////////////
 //	cDevice
 //////////////////////////////////////////////////////////////////////////////
@@ -1702,7 +1981,7 @@ class cMyDevice:public cDevice
     cMyDevice(void);
     virtual ~ cMyDevice(void);
 
-    virtual void GetOsdSize(int &, int &, double &);
+    //virtual void GetOsdSize(int &, int &, double &);
   protected:
     virtual void MakePrimaryDevice(bool);
 };
@@ -1732,11 +2011,11 @@ void cMyDevice::MakePrimaryDevice(bool on)
     }
 }
 
-#endif
-
 //////////////////////////////////////////////////////////////////////////////
 //	cPlugin
 //////////////////////////////////////////////////////////////////////////////
+
+static volatile int DoMakePrimary;	///< switch primary device to this
 
 class cMyPlugin:public cPlugin
 {
@@ -1751,7 +2030,7 @@ class cMyPlugin:public cPlugin
     //virtual bool Start(void);
     //virtual void Stop(void);
     //virtual void Housekeeping(void);
-    //virtual void MainThreadHook(void);
+    virtual void MainThreadHook(void);
     virtual const char *MainMenuEntry(void);
     virtual cOsdObject *MainMenuAction(void);
     virtual cMenuSetupPage *SetupMenu(void);
@@ -1872,20 +2151,20 @@ cOsdObject *cMyPlugin::MainMenuAction(void)
     return new cPlayMenu("Play");
 }
 
-#if 0
-
 /**
 **	Called for every plugin once during every cycle of VDR's main program
 **	loop.
 */
 void cMyPlugin::MainThreadHook(void)
 {
-    //Debug(3, "[play]%s:\n", __FUNCTION__);
+    // Debug(3, "[play]%s:\n", __FUNCTION__);
 
-    //::MainThreadHook();
+    if (DoMakePrimary) {
+	Debug(3, "[play]: switching primary device to %d\n", DoMakePrimary);
+	cDevice::SetPrimaryDevice(DoMakePrimary);
+	DoMakePrimary = 0;
+    }
 }
-
-#endif
 
 /**
 **	Return our setup menu.
@@ -1915,6 +2194,36 @@ bool cMyPlugin::SetupParse(const char *name, const char *value)
     }
 
     return false;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+cMyDevice * MyDevice;				///< dummy device
+int OldPrimaryDevice;				///< old primary device
+
+/**
+**	Create dummy device.
+*/
+void CreateDummyDevice(void)
+{
+    if (!MyDevice) {
+	MyDevice = new cMyDevice;
+    }
+    OldPrimaryDevice = cDevice::PrimaryDevice()->DeviceNumber() + 1;
+    DoMakePrimary = MyDevice->DeviceNumber() + 1;
+    //new cMyOsdProvider();
+}
+
+/**
+**	Destroy dummy device.
+*/
+void DestroyDummyDevice(void)
+{
+    DoMakePrimary = OldPrimaryDevice;
+    OldPrimaryDevice = 0;
+    // FIXME: need to wait?
+    //delete MyDevice;
+    //MyDevice = NULL;
 }
 
 VDRPLUGINCREATOR(cMyPlugin);		// Don't touch this!
