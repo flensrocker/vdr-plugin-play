@@ -2,7 +2,7 @@ Source: vdr-plugin-play
 Section: video
 Priority: extra
 Maintainer: Lars Hanisch <dvb@flensrocker.de>
-Build-Depends: cdbs, debhelper (>= 7), vdr-dev (>= 1.7.17), pkg-config, libxcb1-dev (>= 1.8.1), libxcb-util0-dev (>= 0.3.8)
+Build-Depends: cdbs, debhelper (>= 7), vdr-dev (>= 1.7.17), pkg-config, libxcb1-dev (>= 1.8.1), libxcb-util0-dev (>= 0.3.8), libxcb-image0-dev (>= 0.3.9)
 Standards-Version: 3.9.1
 
 Package: vdr-plugin-play
