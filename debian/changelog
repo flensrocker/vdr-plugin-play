@@ -1,8 +1,20 @@
 vdr-plugin-play (0.0.8-0yavdr2~precise) precise; urgency=medium
 
-  * new upstream release
+  * needs libxcb-image0-dev >= 0.3.9
 
- -- Lars Hanisch <dvb@flensrocker.de>  Wed, 18 Jul 2012 19:03:19 +0200
+ -- Gerald Dachs <gda@dachsweb.de>  Wed, 18 Jul 2012 19:11:22 +0200
+
+vdr-plugin-play (0.0.8-0yavdr1~precise) precise; urgency=medium
+
+  * add libxcb-image0-dev to build dependencies
+
+ -- Gerald Dachs <gda@dachsweb.de>  Wed, 18 Jul 2012 18:09:42 +0200
+
+vdr-plugin-play (0.0.8-0yavdr0~precise) precise; urgency=medium
+
+  * new upstream version
+
+ -- Gerald Dachs <gda@dachsweb.de>  Wed, 18 Jul 2012 17:53:00 +0200
 
 vdr-plugin-play (0.0.7-1yavdr0~precise) precise; urgency=medium
 
