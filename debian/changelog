@@ -1,3 +1,9 @@
+vdr-plugin-play (0.0.8-0yavdr3~precise) precise; urgency=medium
+
+  * override install target of original Makefile
+
+ -- Lars Hanisch <dvb@flensrocker.de>  Wed, 18 Jul 2012 23:44:07 +0200
+
 vdr-plugin-play (0.0.8-0yavdr2~precise) precise; urgency=medium
 
   * needs libxcb-image0-dev >= 0.3.9

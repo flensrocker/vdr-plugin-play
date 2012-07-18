@@ -17,3 +17,5 @@ cleanbuilddir::
 common-binary-predeb-arch::
 	sh /usr/share/vdr-dev/dependencies.sh
 
+override_dh_auto_install:
+
