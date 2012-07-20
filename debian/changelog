@@ -1,3 +1,9 @@
+vdr-plugin-play (0.0.9-0yavdr1~precise) precise; urgency=medium
+
+  * add dependency to libxcb-keysyms1
+
+ -- Lars Hanisch <dvb@flensrocker.de>  Fri, 20 Jul 2012 17:14:18 +0200
+
 vdr-plugin-play (0.0.9-0yavdr0~precise) precise; urgency=medium
 
   * new upstream version
