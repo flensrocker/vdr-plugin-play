@@ -26,7 +26,7 @@ RDEPEND=">=media-video/vdr-1.7
 		>=x11-libs/libxcb-1.8
 		x11-libs/xcb-util
 		x11-libs/xcb-util-image
-		x11-libs/xcb-util-keysym
+		x11-libs/xcb-util-keysyms
 		x11-libs/xcb-util-wm
 		|| ( media-video/mplayer media-video/mplayer2 )"
 DEPEND="${RDEPEND}

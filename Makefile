@@ -71,7 +71,7 @@ LIBS += \
 
 ### The object files (add further files here):
 
-OBJS = $(PLUGIN).o
+OBJS = $(PLUGIN).o video.o
 SRCS = $(wildcard $(OBJS:.o=.c)) $(PLUGIN).cpp
 
 ### The main target:

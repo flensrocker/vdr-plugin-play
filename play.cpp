@@ -32,12 +32,17 @@
 #include "config.h"
 #endif
 
+extern "C"
+{
+#include "video.h"
+}
+
 //////////////////////////////////////////////////////////////////////////////
 
     /// vdr-plugin version number.
     /// Makefile extracts the version number for generating the file name
     /// for the distribution archive.
-static const char *const VERSION = "0.0.9"
+static const char *const VERSION = "0.0.10"
 #ifdef GIT_REV
     "-GIT" GIT_REV
 #endif
@@ -51,7 +56,7 @@ static const char *MAINMENUENTRY = trNOOP("Play");
 
 //////////////////////////////////////////////////////////////////////////////
 
-#define Debug(level, fmt...)	printf(fmt)
+#define Debug(level, fmt...)	fprintf(stderr, fmt)
 #define Warning(fmt...)		fprintf(stderr, fmt)
 #define Error(fmt...)		fprintf(stderr, fmt)
 
@@ -67,508 +72,7 @@ static char *ConfigAudioMixer;		///< audio mixer device
 static char *ConfigMixerChannel;	///< audio mixer channel
 static const char *ConfigMplayer = "/usr/bin/mplayer";	///< mplayer executable
 static const char *ConfigX11Display = ":0.0";	///< x11 display
-
-//////////////////////////////////////////////////////////////////////////////
-//	X11 / XCB
-//////////////////////////////////////////////////////////////////////////////
-
-#include <xcb/xcb.h>
-#include <xcb/xcb_icccm.h>
-#include <xcb/xcb_image.h>
-#include <xcb/xcb_pixel.h>
-#include <xcb/xcb_event.h>
-#include <xcb/xcb_keysyms.h>
-#include <X11/keysym.h>                 // keysym XK_
-#include <poll.h>
-
-// C callback feed key press
-extern "C" void FeedKeyPress(const char *, const char *, int, int);
-
-static xcb_connection_t *Connection;	///< xcb connection
-static xcb_colormap_t VideoColormap;	///< video colormap
-static xcb_window_t VideoOsdWindow;	///< video osd window
-static xcb_window_t VideoPlayWindow;	///< video player window
-static xcb_screen_t const *VideoScreen;	///< video screen
-static uint32_t VideoBlankTick;		///< blank cursor timer
-static xcb_cursor_t VideoBlankCursor;	///< empty invisible cursor
-
-static int VideoWindowX;		///< video output window x coordinate
-static int VideoWindowY;		///< video outout window y coordinate
-static unsigned VideoWindowWidth;	///< video output window width
-static unsigned VideoWindowHeight;	///< video output window height
-
-///
-///	Create X11 window.
-///
-///	@param parent	parent of new window
-///	@param visual	visual of parent
-///	@param depth	depth of parent
-///
-static xcb_window_t VideoCreateWindow(xcb_window_t parent, xcb_visualid_t visual,
-    uint8_t depth)
-{
-    uint32_t values[4];
-    xcb_window_t window;
-
-    Debug(3, "video: visual %#0x depth %d\n", visual, depth);
-
-    // Color map
-    VideoColormap = xcb_generate_id(Connection);
-    xcb_create_colormap(Connection, XCB_COLORMAP_ALLOC_NONE, VideoColormap,
-	parent, visual);
-
-    values[0] = 0x00020507;		// ARGB
-    values[1] = 0x00020507;
-    values[2] =
-	XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
-	XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
-	XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_EXPOSURE |
-	XCB_EVENT_MASK_STRUCTURE_NOTIFY;
-    values[3] = VideoColormap;
-    window = xcb_generate_id(Connection);
-    xcb_create_window(Connection, depth, window, parent, VideoWindowX,
-	VideoWindowY, VideoWindowWidth, VideoWindowHeight, 0,
-	XCB_WINDOW_CLASS_INPUT_OUTPUT, visual,
-	XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK |
-	XCB_CW_COLORMAP, values);
-
-    // define only available with xcb-utils-0.3.8
-#ifdef XCB_ICCCM_NUM_WM_SIZE_HINTS_ELEMENTS
-    // FIXME: utf _NET_WM_NAME
-    xcb_icccm_set_wm_name(Connection, window, XCB_ATOM_STRING, 8,
-	sizeof("play control") - 1, "play control");
-    xcb_icccm_set_wm_icon_name(Connection, window, XCB_ATOM_STRING, 8,
-	sizeof("play control") - 1, "play control");
-#endif
-    // define only available with xcb-utils-0.3.6
-#ifdef XCB_NUM_WM_HINTS_ELEMENTS
-    // FIXME: utf _NET_WM_NAME
-    xcb_set_wm_name(Connection, window, XCB_ATOM_STRING,
-	sizeof("play control") - 1, "play control");
-    xcb_set_wm_icon_name(Connection, window, XCB_ATOM_STRING,
-	sizeof("play control") - 1, "play control");
-#endif
-
-    // FIXME: size hints
-
-    // window above parent
-    values[0] = parent;
-    values[1] = XCB_STACK_MODE_ABOVE;
-    xcb_configure_window(Connection, window,
-	XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE, values);
-
-    xcb_map_window(Connection, window);
-
-    //
-    //	hide cursor
-    //
-    if ( VideoBlankCursor == XCB_NONE ) {
-	xcb_pixmap_t pixmap;
-	xcb_cursor_t cursor;
-
-	pixmap = xcb_generate_id(Connection);
-	xcb_create_pixmap(Connection, 1, pixmap, parent, 1, 1);
-	cursor = xcb_generate_id(Connection);
-	xcb_create_cursor(Connection, cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 1,
-	    1);
-	VideoBlankCursor = cursor;
-	VideoBlankTick = 0;
-    }
-
-    values[0] = VideoBlankCursor;
-    xcb_change_window_attributes(Connection, window, XCB_CW_CURSOR, values);
-    // FIXME: free colormap/cursor/pixmap needed?
-
-    return window;
-}
-
-///
-///	Draw a ARGB image.
-///
-static void VideoDrawARGB(int x, int y, int width, int height,
-    const uint8_t *argb)
-{
-    xcb_image_t *xcb_image;
-    xcb_gcontext_t gc;
-    int sx;
-    int sy;
-
-    if (!Connection) {
-	Debug(3, "play: FIXME: must restore osd provider\n");
-	return;
-    }
-
-    gc = xcb_generate_id(Connection);
-    xcb_create_gc(Connection, gc, VideoOsdWindow, 0, NULL);
-
-    xcb_image = xcb_image_create_native(Connection, width, height,
-	XCB_IMAGE_FORMAT_Z_PIXMAP, VideoScreen->root_depth, NULL, 0L, NULL);
-
-    //  fast 32it versions
-    if (xcb_image->bpp == 32) {
-	if (xcb_image->byte_order == XCB_IMAGE_ORDER_LSB_FIRST) {
-	    for ( sy=0; sy<height; ++sy) {
-		for ( sx=0; sx<width; ++sx) {
-		    uint32_t pixel;
-
-		    if (argb[(width * sy + sx) * 4 + 3] < 200) {
-			pixel = 0xFF020507;
-		    } else {
-			pixel = argb[(width * sy + sx) *4 + 0] << 0;
-			pixel |= argb[(width * sy + sx) *4 + 1] << 8;
-			pixel |= argb[(width * sy + sx) *4 + 2] << 16;
-		    }			
-		    xcb_image_put_pixel_Z32L(xcb_image, sx, sy, pixel);
-		}
-	    }
-	} else {
-	    Error(tr("play: unsupported put_image\n"));
-	}
-    } else {
-	for ( sy=0; sy<height; ++sy) {
-	    for ( sx=0; sx<width; ++sx) {
-		uint32_t pixel;
-
-		    if (argb[(width * sy + sx) * 4 + 3] < 200) {
-			pixel = argb[(width * sy + sx) *4 + 3] << 0;
-			pixel |= argb[(width * sy + sx) *4 + 3] << 8;
-			pixel |= argb[(width * sy + sx) *4 + 3] << 16;
-		    } else {
-			pixel = argb[(width * sy + sx) *4 + 0] << 0;
-			pixel |= argb[(width * sy + sx) *4 + 1] << 8;
-			pixel |= argb[(width * sy + sx) *4 + 2] << 16;
-		    }			
-		xcb_image_put_pixel(xcb_image, sx, sy, pixel);
-	    }
-	}
-    }
-
-    // render xcb_image to color data pixmap
-    xcb_image_put(Connection, VideoOsdWindow, gc, xcb_image, x, y, 0);
-    // release xcb_image
-    xcb_image_destroy(xcb_image);
-    xcb_free_gc(Connection, gc);
-    xcb_flush(Connection);
-}
-
-///
-///	Show window.
-///
-void VideoWindowShow(void)
-{
-    if (!Connection) {
-	Debug(3, "play: FIXME: must restore osd provider\n");
-	return;
-    }
-    xcb_map_window(Connection, VideoOsdWindow);
-}
-
-///
-///	Hide window.
-///
-void VideoWindowHide(void)
-{
-    if (!Connection) {
-	Debug(3, "play: FIXME: must restore osd provider\n");
-	return;
-    }
-    xcb_unmap_window(Connection, VideoOsdWindow);
-}
-
-///
-///	Clear window.
-///
-void VideoWindowClear(void)
-{
-    if (!Connection) {
-	Debug(3, "play: FIXME: must restore osd provider\n");
-	return;
-    }
-    xcb_clear_area(Connection, 0, VideoOsdWindow, 0, 0, VideoWindowWidth,
-    	VideoWindowHeight);
-    xcb_flush(Connection);
-}
-
-static xcb_key_symbols_t *XcbKeySymbols;        ///< Keyboard symbols
-static uint16_t NumLockMask;            ///< mod mask for num-lock
-static uint16_t ShiftLockMask;          ///< mod mask for shift-lock
-static uint16_t CapsLockMask;           ///< mod mask for caps-lock
-static uint16_t ModeSwitchMask;         ///< mod mask for mode-switch
-
-///
-///	Handle key press event.
-///
-static void VideoKeyPress(const xcb_key_press_event_t* event)
-{
-    char buf[2];
-    xcb_keysym_t ks0;
-    xcb_keysym_t ks1;
-    xcb_keysym_t keysym;
-    xcb_keycode_t keycode;
-    unsigned modifier;
-
-    if (!XcbKeySymbols) {
-        XcbKeySymbols = xcb_key_symbols_alloc(Connection);
-	if (!XcbKeySymbols) {
-	    Error(tr("play/event: can't read key symbols\n"));
-	    return;
-	}
-	NumLockMask = ShiftLockMask = CapsLockMask = ModeSwitchMask = 0;
-
-	// FIXME: lock and mode keys are not prepared!
-    }
-
-    keycode = event->detail;
-    modifier = event->state;
-    // handle mode-switch
-    if (modifier & ModeSwitchMask) {
-	ks0 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 2);
-	ks1 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 3);
-    } else {
-	ks0 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 0);
-	ks1 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 1);
-    }
-    // use first keysym, if second keysym didn't exists
-    if (ks1 == XCB_NO_SYMBOL) {
-	ks1 = ks0;
-    }
-    // see xcb-util-0.3.6/keysyms/keysyms.c:
-    if (!(modifier & XCB_MOD_MASK_SHIFT) && !(modifier & XCB_MOD_MASK_LOCK)) {
-	keysym = ks0;
-    } else {
-	// FIXME: more cases
-	    
-	keysym = ks0;
-    }
-    
-    // FIXME: use xcb_lookup_string
-    switch (keysym) {
-	case XK_space:
-	    FeedKeyPress("XKeySym", "space", 0, 0);
-	    break;
-	case XK_0 ... XK_9:
-	case XK_a ... XK_z:
-	case XK_A ... XK_Z:
-	    buf[0] = keysym;
-	    buf[1] = '\0';
-	    FeedKeyPress("XKeySym", buf, 0, 0);
-	    break;
-
-	case XK_BackSpace:
-	    FeedKeyPress("XKeySym", "BackSpace", 0, 0);
-	    break;
-	case XK_Tab:
-	    FeedKeyPress("XKeySym", "Tab", 0, 0);
-	    break;
-	case XK_Escape:
-	    FeedKeyPress("XKeySym", "Escape", 0, 0);
-	    break;
-	case XK_Delete:
-	    FeedKeyPress("XKeySym", "Delete", 0, 0);
-	    break;
-
-	case XK_Left:
-	    FeedKeyPress("XKeySym", "Left", 0, 0);
-	    break;
-	case XK_Up:
-	    FeedKeyPress("XKeySym", "Up", 0, 0);
-	    break;
-	case XK_Right:
-	    FeedKeyPress("XKeySym", "Right", 0, 0);
-	    break;
-	case XK_Down:
-	    FeedKeyPress("XKeySym", "Down", 0, 0);
-	    break;
-
-	case XK_F1:
-	    FeedKeyPress("XKeySym", "F1", 0, 0);
-	    break;
-	case XK_F2:
-	    FeedKeyPress("XKeySym", "F2", 0, 0);
-	    break;
-	case XK_F3:
-	    FeedKeyPress("XKeySym", "F3", 0, 0);
-	    break;
-	case XK_F4:
-	    FeedKeyPress("XKeySym", "F4", 0, 0);
-	    break;
-	
-	default:
-	    Debug(3, "play/event: keycode %d\n", event->detail);
-	    break;
-		
-    }
-}
-
-///
-///	Poll video events.
-///
-void VideoPollEvents(void)
-{
-    struct pollfd fds[1];
-    xcb_generic_event_t *event;
-    int n;
-    int delay;
-
-    fds[0].fd = xcb_get_file_descriptor(Connection);
-    fds[0].events = POLLIN | POLLPRI;
-
-    delay = 0;
-    for (;;) {
-	// wait for events or timeout
-	if ((n = poll(fds, 1, delay)) < 0) {
-	    return;
-	}
-	if (n) {
-	    if (fds[0].revents & (POLLIN | POLLPRI)) {
-		if ((event = xcb_poll_for_event(Connection))) {
-
-		    switch (XCB_EVENT_RESPONSE_TYPE(event)) {
-#if 0
-			    // background pixmap no need to redraw
-			case XCB_EXPOSE:
-			    // collapse multi expose
-			    if (!((xcb_expose_event_t *) event)->count) {
-				xcb_clear_area(Connection, 0, Window, 0, 0, 64,
-				    64);
-				// flush the request
-				xcb_flush(Connection);
-			    }
-			    break;
-#endif
-			case XCB_MAP_NOTIFY:
-			    Debug(3, "video/event: MapNotify\n");
-			    // hide cursor after mapping
-			    xcb_change_window_attributes(Connection,
-			    	VideoOsdWindow, XCB_CW_CURSOR,
-				&VideoBlankCursor);
-			    xcb_change_window_attributes(Connection,
-			    	VideoPlayWindow, XCB_CW_CURSOR,
-				&VideoBlankCursor);
-			    break;
-			case XCB_DESTROY_NOTIFY:
-			    return;
-			case XCB_KEY_PRESS:
-			    VideoKeyPress((xcb_key_press_event_t*)event);
-			    break;
-			case XCB_KEY_RELEASE:
-			case XCB_BUTTON_PRESS:
-			case XCB_BUTTON_RELEASE:
-			    break;
-			case XCB_MOTION_NOTIFY:
-			    break;
-
-			case 0:
-			    // error_code
-			    Debug(3, "play/event: error %x\n", event->response_type);
-			    break;
-			default:
-			    // unknown event type, ignore it
-			    Debug(3, "play/event: unknown %x\n", event->response_type);
-			    break;
-		    }
-
-		    free(event);
-		} else {
-		    // no event, can happen, but we must check for close
-		    if (xcb_connection_has_error(Connection)) {
-			return;
-		    }
-		}
-	    }
-	} else {			// timeout
-	    return;
-	}
-    }
-}
-
-///
-///	Set video geometry.
-///
-void VideoSetGeometry(const char* geometry)
-{
-    sscanf(geometry, "%dx%d%d%d", &VideoWindowWidth, &VideoWindowHeight,
-    	&VideoWindowX, &VideoWindowY);
-}
-
-///
-///	Initialize video.
-///
-int VideoInit(void)
-{
-    const char *display_name;
-    xcb_connection_t *connection;
-    xcb_screen_iterator_t iter;
-    int screen_nr;
-    int i;
-
-    display_name = ConfigX11Display ? ConfigX11Display : getenv("DISPLAY");
-
-    //	Open the connection to the X server.
-    connection = xcb_connect(display_name, &screen_nr);
-    if (!connection || xcb_connection_has_error(connection)) {
-	fprintf(stderr, "play: can't connect to X11 server on %s\n",
-	    display_name);
-	return -1;
-    }
-    Connection = connection;
-
-    //	Get the requested screen number
-    iter = xcb_setup_roots_iterator(xcb_get_setup(connection));
-    for (i = 0; i < screen_nr; ++i) {
-	xcb_screen_next(&iter);
-    }
-    VideoScreen = iter.data;
-
-    //
-    //	Default window size
-    //
-    if (!VideoWindowHeight) {
-	if (VideoWindowWidth) {
-	    VideoWindowHeight = (VideoWindowWidth * 9) / 16;
-	} else {			// default to fullscreen
-	    VideoWindowHeight = VideoScreen->height_in_pixels;
-	    VideoWindowWidth = VideoScreen->width_in_pixels;
-	}
-    }
-    if (!VideoWindowWidth) {
-	VideoWindowWidth = (VideoWindowHeight * 16) / 9;
-    }
-
-    VideoPlayWindow = VideoCreateWindow(VideoScreen->root,
-    	VideoScreen->root_visual, VideoScreen->root_depth);
-    VideoOsdWindow = VideoCreateWindow(VideoPlayWindow,
-	VideoScreen->root_visual, VideoScreen->root_depth);
-    Debug(3, "play: osd %x, play %x\n", VideoOsdWindow, VideoPlayWindow);
-
-    xcb_flush(Connection);
-
-    return 0;
-}
-
-///
-///	Cleanup video.
-///
-void VideoExit(void)
-{
-    if (VideoOsdWindow != XCB_NONE) {
-	xcb_destroy_window(Connection, VideoOsdWindow);
-	VideoOsdWindow = XCB_NONE;
-    }
-    if (VideoPlayWindow != XCB_NONE) {
-	xcb_destroy_window(Connection, VideoPlayWindow);
-	VideoPlayWindow = XCB_NONE;
-    }
-    if (VideoColormap != XCB_NONE) {
-	xcb_free_colormap(Connection, VideoColormap);
-	VideoColormap = XCB_NONE;
-    }
-    if (Connection) {
-	xcb_flush(Connection);
-	xcb_disconnect(Connection);
-	Connection = NULL;
-    }
-}
+static uint32_t ConfigColorKey = 0x00020507;	///< color key
 
 //////////////////////////////////////////////////////////////////////////////
 //	Menu
@@ -749,7 +253,8 @@ extern "C"
 	    "  -a audio\tmplayer -ao (alsa:device=hw=0.0) overwrites mplayer.conf\n"
 	    "  -d display\tX11 display (default :0.0) overwrites $DISPLAY\n"
 	    "  -f\t\tmplayer fullscreen playback\n"
-	    "  -g\tgeometry\tx11 window geometry wxh+x+y\n"
+	    "  -g geometry\tx11 window geometry wxh+x+y\n"
+	    "  -k colorkey\tvideo color key (default=0x020507, mplayer2=0x76B901)\n"
 	    "  -m mplayer\tfilename of mplayer executable\n"
 	    "  -o\t\tosd overlay experiments\n" "  -s\t\tmplayer slave mode\n"
 	    "  -v video\tmplayer -vo (vdpau:deint=4:hqscaling=1) overwrites mplayer.conf\n";
@@ -779,7 +284,7 @@ extern "C"
 	}
 
 	for (;;) {
-	    switch (getopt(argc, argv, "-a:d:fg:m:osv:")) {
+	    switch (getopt(argc, argv, "-a:d:fg:k:m:osv:")) {
 		case 'a':		// audio out
 		    ConfigAudioOut = optarg;
 		    continue;
@@ -791,6 +296,9 @@ extern "C"
 		    continue;
 		case 'g':		// geometry
 		    VideoSetGeometry(optarg);
+		    continue;
+		case 'k':		// color key
+		    ConfigColorKey = strtol(optarg, NULL, 0);
 		    continue;
 		case 'm':		// mplayer executable
 		    ConfigMplayer = optarg;
@@ -832,6 +340,9 @@ extern "C"
 //////////////////////////////////////////////////////////////////////////////
 
 static pid_t PlayerPid;			///< player pid
+static char PipeBuf[4096];		///< pipe buffer
+static int PipeCnt;			///< pipe buffer count
+static int PipeIdx;			///< pipe buffer index
 static int PipeOut[2];			///< player write pipe
 static int PipeIn[2];			///< player read pipe
 static char DvdNav;			///< dvdnav active
@@ -845,13 +356,31 @@ static enum __player_state_ {
 */
 
 /**
+**	Parse player output.
+*/
+void PlayerParseLine(const char *data, int size)
+{
+    Debug(3, "player: |%.*s|\n", size, data);
+
+    // data is \0 terminated
+    if (!strncasecmp(data, "DVDNAV_TITLE_IS_MENU", 20)) {
+	DvdNav = 1;
+    } else if (!strncasecmp(data, "DVDNAV_TITLE_IS_MOVIE", 21)) {
+	DvdNav = 2;
+    } else if (!strncasecmp(data, "ID_DVD_VOLUME_ID=", 17)) {
+	Debug(3, "DVD_VOLUME = %s\n", data + 17);
+    }
+}
+
+/**
 **	Poll input pipe.
 */
 void PollPipe(void)
 {
     pollfd poll_fds[1];
-    char buf[1024];
     int n;
+    int i;
+    int l;
 
     // check if something to read
     poll_fds[0].fd = PipeOut[0];
@@ -867,11 +396,30 @@ void PollPipe(void)
 	    break;
     }
 
-    if ((n = read(PipeOut[0], buf, sizeof(buf))) < 0) {
+    // fill buffer
+    if ((n = read(PipeOut[0], PipeBuf + PipeCnt,
+		sizeof(PipeBuf) - PipeCnt)) < 0) {
 	printf("player: read failed: %s\n", strerror(errno));
 	return;
     }
-    printf("player: %.*s\n", n, buf);
+
+    PipeCnt += n;
+    l = 0;
+    for (i = PipeIdx; i < PipeCnt; ++i) {
+	if (PipeBuf[i] == '\n') {
+	    PipeBuf[i] = '\0';
+	    PlayerParseLine(PipeBuf + PipeIdx, i - PipeIdx);
+	    PipeIdx = i + 1;
+	    l = PipeIdx;
+	}
+    }
+
+    if (l) {				// remove consumed bytes
+	memmove(PipeBuf, PipeBuf + l, PipeCnt - l);
+	PipeCnt -= l;
+	PipeIdx -= l;
+    }
+
 }
 
 /**
@@ -923,8 +471,12 @@ void ExecPlayer(const char *filename)
 	args[1] = "-quiet";
 	args[2] = "-msglevel";
 	// FIXME: play with the options
+#ifdef DEBUG
+	args[3] = "all=6:global=4:cplayer=4:identify=4";
+#else
 	args[3] = "all=2:global=2:cplayer=2:identify=4";
-	if (VideoPlayWindow != XCB_NONE) {
+#endif
+	if (ConfigOsdOverlay) {
 	    args[4] = "-noontop";
 	} else {
 	    args[4] = "-ontop";
@@ -958,8 +510,8 @@ void ExecPlayer(const char *filename)
 	} else {
 	    args[argn++] = "-nofs";
 	}
-	if (VideoPlayWindow != XCB_NONE) {
-	    snprintf(wid_buf, sizeof(wid_buf), "%d", VideoPlayWindow);
+	if (VideoGetPlayWindow()) {
+	    snprintf(wid_buf, sizeof(wid_buf), "%d", VideoGetPlayWindow());
 	    args[argn++] = "-wid";
 	    args[argn++] = wid_buf;
 	}
@@ -1184,23 +736,22 @@ static void OsdClose(void)
 }
 
 /**
-**      Get OSD size and aspect.
+**	Get OSD size and aspect.
 **
-**      @param width[OUT]       width of OSD
-**      @param height[OUT]      height of OSD
-**      @param aspect[OUT]      aspect ratio (4/3, 16/9, ...) of OSD
+**	@param width[OUT]	width of OSD
+**	@param height[OUT]	height of OSD
+**	@param aspect[OUT]	aspect ratio (4/3, 16/9, ...) of OSD
 */
-void GetOsdSize(int * width, int *height, double *aspect)
+void GetOsdSize(int *width, int *height, double *aspect)
 {
-    *width = VideoWindowWidth;
-    *height = VideoWindowHeight;
+    VideoGetOsdSize(width, height);
     *aspect = 16.0 / 9.0 / (double)*width * (double)*height;
 }
 
 /**
 **	Draw osd pixmap
 */
-void OsdDrawARGB(int x, int y, int w, int h, const uint8_t *argb)
+void OsdDrawARGB(int x, int y, int w, int h, const uint8_t * argb)
 {
     Debug(3, "play: %s %d,%d %d,%d\n", __FUNCTION__, x, y, w, h);
 
@@ -1212,6 +763,7 @@ extern void GetOsdSize(int *, int *, double *);
 
 /// C plugin close osd
 extern void OsdClose(void);
+
 /// C plugin draw osd pixmap
 extern void OsdDrawARGB(int, int, int, int, const uint8_t *);
 
@@ -1274,8 +826,7 @@ extern "C" void FeedKeyPress(const char *keymap, const char *key, int repeat,
     if (remote) {
 	csoft = (cMyRemote *) remote;
     } else {
-	dsyslog("[play]%s: remote '%s' not found\n", __FUNCTION__,
-	    keymap);
+	dsyslog("[play]%s: remote '%s' not found\n", __FUNCTION__, keymap);
 	csoft = new cMyRemote(keymap);
     }
 
@@ -1523,7 +1074,7 @@ cMyOsdProvider::cMyOsdProvider(void)
 extern void EnableDummyDevice(void);
 extern void DisableDummyDevice(void);
 
-class cMyPlayer:public cPlayer
+class cMyPlayer:public cPlayer, cThread
 {
   private:
     char *FileName;			///< file to play
@@ -1531,7 +1082,9 @@ class cMyPlayer:public cPlayer
      cMyPlayer(const char *);		///< player constructor
      virtual ~ cMyPlayer();		///< player destructor
     void Activate(bool);		///< player attached/detached
-    virtual bool GetReplayMode(bool&,bool&,int&); ///< get current replay mode
+    virtual bool GetReplayMode(bool &, bool &, int &);	///< get current replay mode
+    // thread
+    virtual void Action(void);		///< thread worker
 };
 
 /**
@@ -1544,12 +1097,19 @@ cMyPlayer::cMyPlayer(const char *filename)
 {
     Debug(3, "play/%s: '%s'\n", __FUNCTION__, filename);
 
+    PipeCnt = 0;
+    PipeIdx = 0;
+
     PipeIn[0] = -1;
+    PipeIn[1] = -1;
+    PipeOut[0] = -1;
     PipeOut[1] = -1;
     PlayerPid = 0;
 
     PlayerPaused = 0;
     PlayerSpeed = 1;
+
+    DvdNav = 0;
 
     PlayerVolume = cDevice::CurrentVolume();
     Debug(3, "play: initial volume %d\n", PlayerVolume);
@@ -1565,7 +1125,8 @@ cMyPlayer::~cMyPlayer()
     int waittime;
     int timeout;
 
-    printf("%s: end\n", __FUNCTION__);
+    Debug(3, "%s: end\n", __FUNCTION__);
+
     if (IsPlayerRunning()) {
 	waittime = 0;
 	timeout = 500;			// 0.5s
@@ -1591,6 +1152,8 @@ cMyPlayer::~cMyPlayer()
     }
     PlayerPid = 0;
 
+    Cancel(2);
+
     if (ConfigOsdOverlay) {
 	DisableDummyDevice();
 	VideoExit();
@@ -1608,10 +1171,12 @@ void cMyPlayer::Activate(bool on)
 
     if (on) {
 	if (ConfigOsdOverlay) {
-	    VideoInit();
+	    VideoSetColorKey(ConfigColorKey);
+	    VideoInit(ConfigX11Display);
 	    EnableDummyDevice();
 	}
 	ExecPlayer(FileName);
+	Start();
 	return;
     }
     // FIXME: stop external player
@@ -1620,12 +1185,27 @@ void cMyPlayer::Activate(bool on)
 /**
 **	Get current replay mode.
 */
-bool cMyPlayer::GetReplayMode(bool & play,bool & forward,int & speed)
+bool cMyPlayer::GetReplayMode(bool & play, bool & forward, int &speed)
 {
     play = !PlayerPaused;
     forward = true;
     speed = PlayerSpeed;
     return true;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+**	Thread action.
+*/
+void cMyPlayer::Action(void)
+{
+    Debug(3, "play: player thread started\n");
+    while (Running()) {
+	PollPipe();
+	VideoPollEvents(10);
+    }
+    Debug(3, "play: player thread stopped\n");
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1684,7 +1264,7 @@ bool cMyStatus::GetVolume(int &volume, bool &mute)
 class cMyControl:public cControl
 {
   private:
-    cMyPlayer *Player;			///< our player
+    cMyPlayer * Player;			///< our player
     cSkinDisplayReplay *Display;	///< our osd display
     void ShowReplayMode(void);		///< display replay mode
   public:
@@ -1702,13 +1282,18 @@ class cMyControl:public cControl
 */
 void cMyControl::ShowReplayMode(void)
 {
-    if ( Setup.ShowReplayMode ) {	// use vdr setup
+    // use vdr setup
+    if (Display || (Setup.ShowReplayMode && !cOsd::IsOpen())) {
 	bool play;
 	bool forward;
 	int speed;
 
 	if (GetReplayMode(play, forward, speed)) {
-	    if ( !Display) {
+	    if (!Display) {
+		// no need to show normal play
+		if (play && forward && speed == 1) {
+		    return;
+		}
 		Display = Skins.Current()->DisplayReplay(true);
 	    }
 	    Display->SetMode(play, forward, speed);
@@ -1720,7 +1305,7 @@ void cMyControl::ShowReplayMode(void)
 **	Control constructor.
 */
 cMyControl::cMyControl(const char *filename)
-:cControl(Player = new cMyPlayer(filename))
+:  cControl(Player = new cMyPlayer(filename))
 {
     Display = NULL;
     Status = new cMyStatus;		// start monitoring volume
@@ -1741,11 +1326,23 @@ cMyControl::~cMyControl()
     cStatus::MsgReplaying(this, NULL, NULL, false);
 }
 
+/**
+**	Hide control.
+*/
 void cMyControl::Hide(void)
 {
     Debug(3, "%s:\n", __FUNCTION__);
+
+    if (Display) {
+	delete Display;
+
+	Display = NULL;
+    }
 }
 
+/**
+**	Show control.
+*/
 void cMyControl::Show(void)
 {
     Debug(3, "%s:\n", __FUNCTION__);
@@ -1755,7 +1352,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 {
     eOSState state;
 
-    Debug(3, "%s: %d\n", __FUNCTION__, key);
+    Debug(4, "%s: %d\n", __FUNCTION__, key);
     if (!IsPlayerRunning()) {
 	Hide();
 	//Stop();
@@ -1763,15 +1360,18 @@ eOSState cMyControl::ProcessKey(eKeys key)
     }
     if (ConfigUseSlave) {
 	PollPipe();
-	VideoPollEvents();
+	VideoPollEvents(0);
     }
     //state=cOsdMenu::ProcessKey(key);
     state = osContinue;
     switch (key) {
 	case kUp:
 	    if (DvdNav) {
+		SendCommand("pausing_keep dvdnav up\n");
+		break;
 	    }
 	case kPlay:
+	    Hide();
 	    if (PlayerSpeed != 1) {
 		PlayerSendSetSpeed(PlayerSpeed = 1);
 	    }
@@ -1784,9 +1384,10 @@ eOSState cMyControl::ProcessKey(eKeys key)
 
 	case kDown:
 	    if (DvdNav) {
+		SendCommand("pausing_keep dvdnav down\n");
+		break;
 	    }
 	case kStop:
-	    Hide();
 	    PlayerSendPause();
 	    PlayerPaused ^= 1;
 	    ShowReplayMode();
@@ -1794,8 +1395,10 @@ eOSState cMyControl::ProcessKey(eKeys key)
 
 	case kLeft:
 	    if (DvdNav) {
+		SendCommand("pausing_keep dvdnav left\n");
+		break;
 	    }
-	    if ( PlayerSpeed > 1 ) {
+	    if (PlayerSpeed > 1) {
 		PlayerSendSetSpeed(PlayerSpeed /= 2);
 	    } else {
 		PlayerSendSeek(-10);
@@ -1804,18 +1407,40 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	    break;
 	case kRight:
 	    if (DvdNav) {
+		SendCommand("pausing_keep dvdnav right\n");
+		break;
 	    }
-	    if ( PlayerSpeed < 32 ) {
+	    if (PlayerSpeed < 32) {
 		PlayerSendSetSpeed(PlayerSpeed *= 2);
 	    }
 	    ShowReplayMode();
 	    break;
 
+	case kOk:
+	    if (DvdNav) {
+		SendCommand("pausing_keep dvdnav select\n");
+		break;
+	    }
+	    ShowReplayMode();
+	    break;
+
 	case kBack:
+	    if (DvdNav > 1) {
+		SendCommand("pausing_keep dvdnav prev\n");
+		break;
+	    }
 	    PlayerSendQuit();
 	    // FIXME: need to select old directory and index
 	    cRemote::CallPlugin("play");
 	    return osBack;
+
+	case kMenu:
+	    if (DvdNav) {
+		SendCommand("pausing_keep dvdnav menu\n");
+		break;
+	    }
+	    break;
+
 	default:
 	    break;
     }
@@ -1917,7 +1542,7 @@ static const NameFilter VideoFilters[] = {
     FILTER(".vob"),
     FILTER(".wmv"),
 #undef FILTER
-    { 0, NULL }
+    {0, NULL}
 };
 
 /**
@@ -1930,7 +1555,7 @@ static const NameFilter AudioFilters[] = {
     FILTER(".ogg"),
     FILTER(".wav"),
 #undef FILTER
-    { 0, NULL }
+    {0, NULL}
 };
 
 /**
@@ -2074,7 +1699,7 @@ eOSState cMyMenu::ProcessKey(eKeys key)
 			}
 			// handle DVD image
 			if (!strcmp(text, "AUDIO_TS")
-				|| !strcmp(text, "VIDEO_TS")) {
+			    || !strcmp(text, "VIDEO_TS")) {
 			    char *tmp;
 
 			    free(filename);
@@ -2245,20 +1870,19 @@ void cMyDevice::MakePrimaryDevice(bool on)
 */
 void cMyDevice::GetOsdSize(int &width, int &height, double &pixel_aspect)
 {
-    if( !&width || !&height || !&pixel_aspect) {
+    if (!&width || !&height || !&pixel_aspect) {
 	esyslog(tr("[softhddev]: GetOsdSize invalid pointer(s)\n"));
 	return;
     }
-    width = VideoWindowWidth;
-    height = VideoWindowHeight;
-    pixel_aspect = 16.0 / 9.0 / (double)width * (double)height;
+    VideoGetOsdSize(&width, &height);
+    pixel_aspect = 16.0 / 9.0 / (double)width *(double)height;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 //	cPlugin
 //////////////////////////////////////////////////////////////////////////////
 
-static cMyDevice * MyDevice;		///< dummy device needed for osd
+static cMyDevice *MyDevice;		///< dummy device needed for osd
 static volatile int DoMakePrimary;	///< switch primary device to this
 
 class cMyPlugin:public cPlugin
@@ -2443,7 +2067,7 @@ bool cMyPlugin::SetupParse(const char *name, const char *value)
 
 //////////////////////////////////////////////////////////////////////////////
 
-int OldPrimaryDevice;				///< old primary device
+int OldPrimaryDevice;			///< old primary device
 
 /**
 **	Enable dummy device.
