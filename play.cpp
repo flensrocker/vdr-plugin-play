@@ -37,7 +37,7 @@
     /// vdr-plugin version number.
     /// Makefile extracts the version number for generating the file name
     /// for the distribution archive.
-static const char *const VERSION = "0.0.8"
+static const char *const VERSION = "0.0.9"
 #ifdef GIT_REV
     "-GIT" GIT_REV
 #endif
@@ -69,12 +69,20 @@ static const char *ConfigMplayer = "/usr/bin/mplayer";	///< mplayer executable
 static const char *ConfigX11Display = ":0.0";	///< x11 display
 
 //////////////////////////////////////////////////////////////////////////////
-//	X11
+//	X11 / XCB
 //////////////////////////////////////////////////////////////////////////////
 
 #include <xcb/xcb.h>
+#include <xcb/xcb_icccm.h>
 #include <xcb/xcb_image.h>
 #include <xcb/xcb_pixel.h>
+#include <xcb/xcb_event.h>
+#include <xcb/xcb_keysyms.h>
+#include <X11/keysym.h>                 // keysym XK_
+#include <poll.h>
+
+// C callback feed key press
+extern "C" void FeedKeyPress(const char *, const char *, int, int);
 
 static xcb_connection_t *Connection;	///< xcb connection
 static xcb_colormap_t VideoColormap;	///< video colormap
@@ -243,142 +251,29 @@ static void VideoDrawARGB(int x, int y, int width, int height,
     xcb_flush(Connection);
 }
 
-#if 0
-static ScaledIcon *IconGetScaled(Icon * icon, int width, int height)
+///
+///	Show window.
+///
+void VideoWindowShow(void)
 {
-    ScaledIcon *scaled;
-    xcb_image_t *xcb_image;
-    int x;
-    int y;
-    int i;
-    int n;
-    double scale_x;
-    double scale_y;
-    double src_x;
-    double src_y;
-    uint8_t *argb;
-    uint8_t *mask;
-    int mask_width;
-
-    // calculated scaled icon size
-    if (!width) {
-	width = icon->Image->Width;
+    if (!Connection) {
+	Debug(3, "play: FIXME: must restore osd provider\n");
+	return;
     }
-    if (!height) {
-	height = icon->Image->Height;
-    }
-    Debug(4, "icon %dx%d -> %dx%d\n", icon->Image->Width, icon->Image->Height,
-	width, height);
-
-    // keep icon aspect ratio
-    i = (icon->Image->Width * 65536) / icon->Image->Height;
-    width = MIN(width * 65536, height * i);
-    height = MIN(height, width / i);
-    width = (height * i) / 65536;
-    if (width < 1) {
-	width = 1;
-    }
-    if (height < 1) {
-	height = 1;
-    }
-    // check if this size already exists
-    SLIST_FOREACH(scaled, &icon->Scaled, Next) {
-	if (scaled->Width == width && scaled->Height == height) {
-	    return scaled;
-	}
-    }
-
-    // see if we can use XCB render to create icon
-    if ((scaled = IconCreateRenderScaled(icon, width, height))) {
-	return scaled;
-    }
-
-    Debug(3, "new scaled icon from %dx%d\n", width, height);
-    // create a new ScaledIcon old-fashioned way
-    scaled = malloc(sizeof(*scaled));
-    SLIST_INSERT_HEAD(&icon->Scaled, scaled, Next);
-    scaled->Width = width;
-    scaled->Height = height;
-
-    // determine, if we need a mask, alpha > 128!
-    mask = NULL;
-    mask_width = (width + 7) / 8;	// moved out of if, to make gcc happy
-    n = 4 * icon->Image->Height * icon->Image->Width;
-    for (i = 0; i < n; i += 4) {
-	if (icon->Image->Data[i] < 128) {
-	    //
-	    //	allocate empty mask (if mask is needed)
-	    //
-	    i = mask_width * height;
-	    if ((mask = malloc(i))) {	// malloc success
-		memset(mask, 255, i);
-	    }
-	    break;
-	}
-    }
-
-    // create a temporary xcb_image for scaling
-    xcb_image =
-	xcb_image_create_native(Connection, width, height,
-	(XcbScreen->root_depth ==
-	    1) ? XCB_IMAGE_FORMAT_XY_BITMAP : XCB_IMAGE_FORMAT_Z_PIXMAP,
-	XcbScreen->root_depth, NULL, 0L, NULL);
-
-    // determine scale factor
-    // FIXME: remove doubles
-    scale_x = (double)icon->Image->Width / width;
-    scale_y = (double)icon->Image->Height / height;
-
-    argb = icon->Image->Data;
-    src_y = 0.0;
-    for (y = 0; y < height; y++) {
-	src_x = 0.0;
-	n = (int)src_y *icon->Image->Width;
-
-	for (x = 0; x < width; x++) {
-	    xcb_coloritem_t color;
-
-	    i = 4 * (n + (int)src_x);
-
-	    if (argb[i] < 128) {
-		mask[(y * mask_width) + (x >> 3)] &= (~(1 << (x & 7)));
-	    }
-
-	    color.red = (65535 * (argb[i + 1]) / 255);
-	    color.green = (65535 * (argb[i + 2]) / 255);
-	    color.blue = (65535 * (argb[i + 3]) / 255);
-	    ColorGetPixel(&color);
-
-	    // FIXME: use fast put pixel
-	    xcb_image_put_pixel(xcb_image, x, y, color.pixel);
-
-	    src_x += scale_x;
-	}
-
-	src_y += scale_y;
-    }
-
-    // create color data pixmap
-    scaled->Image.Pixmap = xcb_generate_id(Connection);
-    xcb_create_pixmap(Connection, XcbScreen->root_depth, scaled->Image.Pixmap,
-	XcbScreen->root, width, height);
-    // render xcb_image to color data pixmap
-    xcb_image_put(Connection, scaled->Image.Pixmap, RootGC, xcb_image, 0, 0,
-	0);
-    // release xcb_image
-    xcb_image_destroy(xcb_image);
-
-    scaled->Mask.Pixmap = XCB_NONE;
-    if (mask) {
-	scaled->Mask.Pixmap =
-	    xcb_create_pixmap_from_bitmap_data(Connection, XcbScreen->root,
-	    mask, width, height, 1, 0, 0, NULL);
-	free(mask);
-    }
-
-    return scaled;
+    xcb_map_window(Connection, VideoOsdWindow);
 }
-#endif
+
+///
+///	Hide window.
+///
+void VideoWindowHide(void)
+{
+    if (!Connection) {
+	Debug(3, "play: FIXME: must restore osd provider\n");
+	return;
+    }
+    xcb_unmap_window(Connection, VideoOsdWindow);
+}
 
 ///
 ///	Clear window.
@@ -392,6 +287,199 @@ void VideoWindowClear(void)
     xcb_clear_area(Connection, 0, VideoOsdWindow, 0, 0, VideoWindowWidth,
     	VideoWindowHeight);
     xcb_flush(Connection);
+}
+
+static xcb_key_symbols_t *XcbKeySymbols;        ///< Keyboard symbols
+static uint16_t NumLockMask;            ///< mod mask for num-lock
+static uint16_t ShiftLockMask;          ///< mod mask for shift-lock
+static uint16_t CapsLockMask;           ///< mod mask for caps-lock
+static uint16_t ModeSwitchMask;         ///< mod mask for mode-switch
+
+///
+///	Handle key press event.
+///
+static void VideoKeyPress(const xcb_key_press_event_t* event)
+{
+    char buf[2];
+    xcb_keysym_t ks0;
+    xcb_keysym_t ks1;
+    xcb_keysym_t keysym;
+    xcb_keycode_t keycode;
+    unsigned modifier;
+
+    if (!XcbKeySymbols) {
+        XcbKeySymbols = xcb_key_symbols_alloc(Connection);
+	if (!XcbKeySymbols) {
+	    Error(tr("play/event: can't read key symbols\n"));
+	    return;
+	}
+	NumLockMask = ShiftLockMask = CapsLockMask = ModeSwitchMask = 0;
+
+	// FIXME: lock and mode keys are not prepared!
+    }
+
+    keycode = event->detail;
+    modifier = event->state;
+    // handle mode-switch
+    if (modifier & ModeSwitchMask) {
+	ks0 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 2);
+	ks1 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 3);
+    } else {
+	ks0 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 0);
+	ks1 = xcb_key_symbols_get_keysym(XcbKeySymbols, keycode, 1);
+    }
+    // use first keysym, if second keysym didn't exists
+    if (ks1 == XCB_NO_SYMBOL) {
+	ks1 = ks0;
+    }
+    // see xcb-util-0.3.6/keysyms/keysyms.c:
+    if (!(modifier & XCB_MOD_MASK_SHIFT) && !(modifier & XCB_MOD_MASK_LOCK)) {
+	keysym = ks0;
+    } else {
+	// FIXME: more cases
+	    
+	keysym = ks0;
+    }
+    
+    // FIXME: use xcb_lookup_string
+    switch (keysym) {
+	case XK_space:
+	    FeedKeyPress("XKeySym", "space", 0, 0);
+	    break;
+	case XK_0 ... XK_9:
+	case XK_a ... XK_z:
+	case XK_A ... XK_Z:
+	    buf[0] = keysym;
+	    buf[1] = '\0';
+	    FeedKeyPress("XKeySym", buf, 0, 0);
+	    break;
+
+	case XK_BackSpace:
+	    FeedKeyPress("XKeySym", "BackSpace", 0, 0);
+	    break;
+	case XK_Tab:
+	    FeedKeyPress("XKeySym", "Tab", 0, 0);
+	    break;
+	case XK_Escape:
+	    FeedKeyPress("XKeySym", "Escape", 0, 0);
+	    break;
+	case XK_Delete:
+	    FeedKeyPress("XKeySym", "Delete", 0, 0);
+	    break;
+
+	case XK_Left:
+	    FeedKeyPress("XKeySym", "Left", 0, 0);
+	    break;
+	case XK_Up:
+	    FeedKeyPress("XKeySym", "Up", 0, 0);
+	    break;
+	case XK_Right:
+	    FeedKeyPress("XKeySym", "Right", 0, 0);
+	    break;
+	case XK_Down:
+	    FeedKeyPress("XKeySym", "Down", 0, 0);
+	    break;
+
+	case XK_F1:
+	    FeedKeyPress("XKeySym", "F1", 0, 0);
+	    break;
+	case XK_F2:
+	    FeedKeyPress("XKeySym", "F2", 0, 0);
+	    break;
+	case XK_F3:
+	    FeedKeyPress("XKeySym", "F3", 0, 0);
+	    break;
+	case XK_F4:
+	    FeedKeyPress("XKeySym", "F4", 0, 0);
+	    break;
+	
+	default:
+	    Debug(3, "play/event: keycode %d\n", event->detail);
+	    break;
+		
+    }
+}
+
+///
+///	Poll video events.
+///
+void VideoPollEvents(void)
+{
+    struct pollfd fds[1];
+    xcb_generic_event_t *event;
+    int n;
+    int delay;
+
+    fds[0].fd = xcb_get_file_descriptor(Connection);
+    fds[0].events = POLLIN | POLLPRI;
+
+    delay = 0;
+    for (;;) {
+	// wait for events or timeout
+	if ((n = poll(fds, 1, delay)) < 0) {
+	    return;
+	}
+	if (n) {
+	    if (fds[0].revents & (POLLIN | POLLPRI)) {
+		if ((event = xcb_poll_for_event(Connection))) {
+
+		    switch (XCB_EVENT_RESPONSE_TYPE(event)) {
+#if 0
+			    // background pixmap no need to redraw
+			case XCB_EXPOSE:
+			    // collapse multi expose
+			    if (!((xcb_expose_event_t *) event)->count) {
+				xcb_clear_area(Connection, 0, Window, 0, 0, 64,
+				    64);
+				// flush the request
+				xcb_flush(Connection);
+			    }
+			    break;
+#endif
+			case XCB_MAP_NOTIFY:
+			    Debug(3, "video/event: MapNotify\n");
+			    // hide cursor after mapping
+			    xcb_change_window_attributes(Connection,
+			    	VideoOsdWindow, XCB_CW_CURSOR,
+				&VideoBlankCursor);
+			    xcb_change_window_attributes(Connection,
+			    	VideoPlayWindow, XCB_CW_CURSOR,
+				&VideoBlankCursor);
+			    break;
+			case XCB_DESTROY_NOTIFY:
+			    return;
+			case XCB_KEY_PRESS:
+			    VideoKeyPress((xcb_key_press_event_t*)event);
+			    break;
+			case XCB_KEY_RELEASE:
+			case XCB_BUTTON_PRESS:
+			case XCB_BUTTON_RELEASE:
+			    break;
+			case XCB_MOTION_NOTIFY:
+			    break;
+
+			case 0:
+			    // error_code
+			    Debug(3, "play/event: error %x\n", event->response_type);
+			    break;
+			default:
+			    // unknown event type, ignore it
+			    Debug(3, "play/event: unknown %x\n", event->response_type);
+			    break;
+		    }
+
+		    free(event);
+		} else {
+		    // no event, can happen, but we must check for close
+		    if (xcb_connection_has_error(Connection)) {
+			return;
+		    }
+		}
+	    }
+	} else {			// timeout
+	    return;
+	}
+    }
 }
 
 ///
@@ -664,7 +752,7 @@ extern "C"
 	    "  -g\tgeometry\tx11 window geometry wxh+x+y\n"
 	    "  -m mplayer\tfilename of mplayer executable\n"
 	    "  -o\t\tosd overlay experiments\n" "  -s\t\tmplayer slave mode\n"
-	    "  -v video\tmplayer -vo (vdpau:deint=4,hqscaling=1) overwrites mplayer.conf\n";
+	    "  -v video\tmplayer -vo (vdpau:deint=4:hqscaling=1) overwrites mplayer.conf\n";
     }
 
 /**
@@ -859,6 +947,10 @@ void ExecPlayer(const char *filename)
 	if (ConfigUseSlave) {
 	    args[argn++] = "-slave";
 	    //args[argn++] = "-idle";
+	}
+	if (ConfigOsdOverlay) {		// no mplayer osd with overlay
+	    args[argn++] = "-osdlevel";
+	    args[argn++] = "0";
 	}
 	if (ConfigFullscreen) {
 	    args[argn++] = "-fs";
@@ -1071,23 +1163,38 @@ static void PlayerSendVolume(void)
 //////////////////////////////////////////////////////////////////////////////
 
 /**
+**	Open OSD.
+*/
+static void OsdOpen(void)
+{
+    Debug(3, "play: %s\n", __FUNCTION__);
+
+    VideoWindowShow();
+}
+
+/**
 **	Close OSD.
 */
 static void OsdClose(void)
 {
     Debug(3, "play: %s\n", __FUNCTION__);
 
+    VideoWindowHide();
     VideoWindowClear();
 }
 
 /**
-**	Get OSD size.
+**      Get OSD size and aspect.
+**
+**      @param width[OUT]       width of OSD
+**      @param height[OUT]      height of OSD
+**      @param aspect[OUT]      aspect ratio (4/3, 16/9, ...) of OSD
 */
-void GetOsdSize(int * w, int *h, double *a)
+void GetOsdSize(int * width, int *height, double *aspect)
 {
-    *w = 1920;
-    *h = 1080;
-    *a = 1.0;
+    *width = VideoWindowWidth;
+    *height = VideoWindowHeight;
+    *aspect = 16.0 / 9.0 / (double)*width * (double)*height;
 }
 
 /**
@@ -1107,6 +1214,78 @@ extern void GetOsdSize(int *, int *, double *);
 extern void OsdClose(void);
 /// C plugin draw osd pixmap
 extern void OsdDrawARGB(int, int, int, int, const uint8_t *);
+
+//////////////////////////////////////////////////////////////////////////////
+//	C Callbacks
+//////////////////////////////////////////////////////////////////////////////
+
+/**
+**	Device plugin remote class.
+*/
+class cMyRemote:public cRemote
+{
+  public:
+
+    /**
+    **	Soft device remote class constructor.
+    **
+    **	@param name	remote name
+    */
+    cMyRemote(const char *name):cRemote(name)
+    {
+    }
+
+    /**
+    **	Put keycode into vdr event queue.
+    **
+    **	@param code	key code
+    **	@param repeat	flag key repeated
+    **	@param release	flag key released
+    */
+    bool Put(const char *code, bool repeat = false, bool release = false) {
+	return cRemote::Put(code, repeat, release);
+    }
+};
+
+/**
+**	Feed key press as remote input (called from C part).
+**
+**	@param keymap	target keymap "XKeymap" name
+**	@param key	pressed/released key name
+**	@param repeat	repeated key flag
+**	@param release	released key flag
+*/
+extern "C" void FeedKeyPress(const char *keymap, const char *key, int repeat,
+    int release)
+{
+    cRemote *remote;
+    cMyRemote *csoft;
+
+    if (!keymap || !key) {
+	return;
+    }
+    // find remote
+    for (remote = Remotes.First(); remote; remote = Remotes.Next(remote)) {
+	if (!strcmp(remote->Name(), keymap)) {
+	    break;
+	}
+    }
+    // if remote not already exists, create it
+    if (remote) {
+	csoft = (cMyRemote *) remote;
+    } else {
+	dsyslog("[play]%s: remote '%s' not found\n", __FUNCTION__,
+	    keymap);
+	csoft = new cMyRemote(keymap);
+    }
+
+    //dsyslog("[softhddev]%s %s, %s\n", __FUNCTION__, keymap, key);
+    if (key[1]) {			// no single character
+	csoft->Put(key, repeat, release);
+    } else if (!csoft->Put(key, repeat, release)) {
+	cRemote::Put(KBDKEY(key[0]));	// feed it for edit mode
+    }
+}
 
 //////////////////////////////////////////////////////////////////////////////
 //	cOsd
@@ -1146,6 +1325,7 @@ void cMyOsd::SetActive(bool on)
     cOsd::SetActive(on);
     if (on) {
 	Dirty = 1;
+	OsdOpen();
     } else {
 	OsdClose();
     }
@@ -1340,8 +1520,8 @@ cMyOsdProvider::cMyOsdProvider(void)
 //	cPlayer
 //////////////////////////////////////////////////////////////////////////////
 
-extern void CreateDummyDevice(void);
-extern void DestroyDummyDevice(void);
+extern void EnableDummyDevice(void);
+extern void DisableDummyDevice(void);
 
 class cMyPlayer:public cPlayer
 {
@@ -1351,6 +1531,7 @@ class cMyPlayer:public cPlayer
      cMyPlayer(const char *);		///< player constructor
      virtual ~ cMyPlayer();		///< player destructor
     void Activate(bool);		///< player attached/detached
+    virtual bool GetReplayMode(bool&,bool&,int&); ///< get current replay mode
 };
 
 /**
@@ -1411,7 +1592,7 @@ cMyPlayer::~cMyPlayer()
     PlayerPid = 0;
 
     if (ConfigOsdOverlay) {
-	DestroyDummyDevice();
+	DisableDummyDevice();
 	VideoExit();
     }
     ClosePipes();
@@ -1428,12 +1609,23 @@ void cMyPlayer::Activate(bool on)
     if (on) {
 	if (ConfigOsdOverlay) {
 	    VideoInit();
-	    CreateDummyDevice();
+	    EnableDummyDevice();
 	}
 	ExecPlayer(FileName);
 	return;
     }
     // FIXME: stop external player
+}
+
+/**
+**	Get current replay mode.
+*/
+bool cMyPlayer::GetReplayMode(bool & play,bool & forward,int & speed)
+{
+    play = !PlayerPaused;
+    forward = true;
+    speed = PlayerSpeed;
+    return true;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1491,8 +1683,10 @@ bool cMyStatus::GetVolume(int &volume, bool &mute)
 
 class cMyControl:public cControl
 {
+  private:
     cMyPlayer *Player;			///< our player
     cSkinDisplayReplay *Display;	///< our osd display
+    void ShowReplayMode(void);		///< display replay mode
   public:
     cMyControl(const char *);
     virtual ~ cMyControl();
@@ -1500,7 +1694,27 @@ class cMyControl:public cControl
     virtual eOSState ProcessKey(eKeys);
     virtual void Show(void);
     virtual void Hide(void);
+
 };
+
+/**
+**	Show replay mode.
+*/
+void cMyControl::ShowReplayMode(void)
+{
+    if ( Setup.ShowReplayMode ) {	// use vdr setup
+	bool play;
+	bool forward;
+	int speed;
+
+	if (GetReplayMode(play, forward, speed)) {
+	    if ( !Display) {
+		Display = Skins.Current()->DisplayReplay(true);
+	    }
+	    Display->SetMode(play, forward, speed);
+	}
+    }
+}
 
 /**
 **	Control constructor.
@@ -1541,7 +1755,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 {
     eOSState state;
 
-    printf("%s: %d\n", __FUNCTION__, key);
+    Debug(3, "%s: %d\n", __FUNCTION__, key);
     if (!IsPlayerRunning()) {
 	Hide();
 	//Stop();
@@ -1549,6 +1763,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
     }
     if (ConfigUseSlave) {
 	PollPipe();
+	VideoPollEvents();
     }
     //state=cOsdMenu::ProcessKey(key);
     state = osContinue;
@@ -1564,6 +1779,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 		PlayerSendPause();
 		PlayerPaused ^= 1;
 	    }
+	    ShowReplayMode();
 	    break;
 
 	case kDown:
@@ -1573,6 +1789,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	    Hide();
 	    PlayerSendPause();
 	    PlayerPaused ^= 1;
+	    ShowReplayMode();
 	    break;
 
 	case kLeft:
@@ -1583,6 +1800,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	    } else {
 		PlayerSendSeek(-10);
 	    }
+	    ShowReplayMode();
 	    break;
 	case kRight:
 	    if (DvdNav) {
@@ -1590,6 +1808,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	    if ( PlayerSpeed < 32 ) {
 		PlayerSendSetSpeed(PlayerSpeed *= 2);
 	    }
+	    ShowReplayMode();
 	    break;
 
 	case kBack:
@@ -1609,7 +1828,7 @@ eOSState cMyControl::ProcessKey(eKeys key)
 */
 void PlayFile(const char *filename)
 {
-    printf("play: play file '%s'\n", filename);
+    Debug(3, "play: play file '%s'\n", filename);
     cControl::Launch(new cMyControl(filename));
 }
 
@@ -1687,9 +1906,11 @@ static const NameFilter VideoFilters[] = {
 #define FILTER(x) { sizeof(x) - 1, x }
     FILTER(".ts"),
     FILTER(".avi"),
+    FILTER(".flv"),
     FILTER(".iso"),
     FILTER(".m4v"),
     FILTER(".mkv"),
+    FILTER(".mov"),
     FILTER(".mp4"),
     FILTER(".mpg"),
     FILTER(".vdr"),
@@ -1981,16 +2202,22 @@ class cMyDevice:public cDevice
     cMyDevice(void);
     virtual ~ cMyDevice(void);
 
-    //virtual void GetOsdSize(int &, int &, double &);
+    virtual void GetOsdSize(int &, int &, double &);
   protected:
     virtual void MakePrimaryDevice(bool);
 };
 
+/**
+**	Device constructor.
+*/
 cMyDevice::cMyDevice(void)
 {
     Debug(3, "[play]%s\n", __FUNCTION__);
 }
 
+/**
+**	Device destructor. (never called!)
+*/
 cMyDevice::~cMyDevice(void)
 {
     Debug(3, "[play]%s:\n", __FUNCTION__);
@@ -2011,10 +2238,27 @@ void cMyDevice::MakePrimaryDevice(bool on)
     }
 }
 
+/**
+**	Returns the width, height and pixel_aspect ratio the OSD.
+**
+**	FIXME: Called every second, for nothing (no OSD displayed)?
+*/
+void cMyDevice::GetOsdSize(int &width, int &height, double &pixel_aspect)
+{
+    if( !&width || !&height || !&pixel_aspect) {
+	esyslog(tr("[softhddev]: GetOsdSize invalid pointer(s)\n"));
+	return;
+    }
+    width = VideoWindowWidth;
+    height = VideoWindowHeight;
+    pixel_aspect = 16.0 / 9.0 / (double)width * (double)height;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 //	cPlugin
 //////////////////////////////////////////////////////////////////////////////
 
+static cMyDevice * MyDevice;		///< dummy device needed for osd
 static volatile int DoMakePrimary;	///< switch primary device to this
 
 class cMyPlugin:public cPlugin
@@ -2026,7 +2270,7 @@ class cMyPlugin:public cPlugin
     virtual const char *Description(void);
     virtual const char *CommandLineHelp(void);
     virtual bool ProcessArgs(int, char *[]);
-    //virtual bool Initialize(void);
+    virtual bool Initialize(void);
     //virtual bool Start(void);
     //virtual void Stop(void);
     //virtual void Housekeeping(void);
@@ -2083,8 +2327,6 @@ bool cMyPlugin::ProcessArgs(int argc, char *argv[])
     return true;
 }
 
-#if 0
-
 /**
 **	Start any background activities the plugin shall perform.
 */
@@ -2096,8 +2338,11 @@ bool cMyPlugin::Initialize(void)
     //Status = new cMyStatus;		// start monitoring
     // FIXME: destructs memory
 
+    MyDevice = new cMyDevice;
     return true;
 }
+
+#if 0
 
 /**
 **	 Start any background activities the plugin shall perform.
@@ -2198,32 +2443,24 @@ bool cMyPlugin::SetupParse(const char *name, const char *value)
 
 //////////////////////////////////////////////////////////////////////////////
 
-cMyDevice * MyDevice;				///< dummy device
 int OldPrimaryDevice;				///< old primary device
 
 /**
-**	Create dummy device.
+**	Enable dummy device.
 */
-void CreateDummyDevice(void)
+void EnableDummyDevice(void)
 {
-    if (!MyDevice) {
-	MyDevice = new cMyDevice;
-    }
     OldPrimaryDevice = cDevice::PrimaryDevice()->DeviceNumber() + 1;
     DoMakePrimary = MyDevice->DeviceNumber() + 1;
-    //new cMyOsdProvider();
 }
 
 /**
-**	Destroy dummy device.
+**	Disable dummy device.
 */
-void DestroyDummyDevice(void)
+void DisableDummyDevice(void)
 {
     DoMakePrimary = OldPrimaryDevice;
     OldPrimaryDevice = 0;
-    // FIXME: need to wait?
-    //delete MyDevice;
-    //MyDevice = NULL;
 }
 
 VDRPLUGINCREATOR(cMyPlugin);		// Don't touch this!

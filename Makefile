@@ -60,14 +60,14 @@ DEFINES += $(CONFIG) -D_GNU_SOURCE -DPLUGIN_NAME_I18N='"$(PLUGIN)"' \
 	$(if $(GIT_REV), -DGIT_REV='"$(GIT_REV)"')
 
 _CFLAGS = $(DEFINES) $(INCLUDES) \
-	$(shell pkg-config --cflags xcb xcb-image) 
+	$(shell pkg-config --cflags xcb xcb-event xcb-keysyms xcb-icccm xcb-image) 
 
 #override _CFLAGS  += -Werror
 override CXXFLAGS += $(_CFLAGS)
 override CFLAGS	  += $(_CFLAGS)
 
 LIBS += \
-	$(shell pkg-config --libs xcb xcb-image) 
+	$(shell pkg-config --libs xcb xcb-keysyms xcb-event xcb-icccm xcb-image) 
 
 ### The object files (add further files here):
 
