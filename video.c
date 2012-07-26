@@ -60,6 +60,7 @@ static xcb_window_t VideoOsdWindow;	///< video osd window
 static xcb_window_t VideoPlayWindow;	///< video player window
 static xcb_screen_t const *VideoScreen;	///< video screen
 static uint32_t VideoBlankTick;		///< blank cursor timer
+static xcb_pixmap_t VideoPixmap;	///< blank cursor pixmap
 static xcb_cursor_t VideoBlankCursor;	///< empty invisible cursor
 
 static uint32_t VideoColorKey;		///< color key pixel value
@@ -81,15 +82,30 @@ static unsigned VideoWindowHeight;	///< video output window height
 static xcb_window_t VideoCreateWindow(xcb_window_t parent,
     xcb_visualid_t visual, uint8_t depth)
 {
-    uint32_t values[4];
+    uint32_t values[5];
     xcb_window_t window;
 
     Debug(3, "video: visual %#0x depth %d\n", visual, depth);
 
-    // Color map
-    VideoColormap = xcb_generate_id(Connection);
-    xcb_create_colormap(Connection, XCB_COLORMAP_ALLOC_NONE, VideoColormap,
-	parent, visual);
+    //
+    // create color map
+    //
+    if (VideoColormap == XCB_NONE) {
+	VideoColormap = xcb_generate_id(Connection);
+	xcb_create_colormap(Connection, XCB_COLORMAP_ALLOC_NONE, VideoColormap,
+	    parent, visual);
+    }
+    //
+    //	create blank cursor
+    //
+    if (VideoBlankCursor == XCB_NONE) {
+	VideoPixmap = xcb_generate_id(Connection);
+	xcb_create_pixmap(Connection, 1, VideoPixmap, parent, 1, 1);
+	VideoBlankCursor = xcb_generate_id(Connection);
+	xcb_create_cursor(Connection, VideoBlankCursor, VideoPixmap,
+	    VideoPixmap, 0, 0, 0, 0, 0, 0, 1, 1);
+	VideoBlankTick = 0;
+    }
 
     values[0] = VideoColorKey;		// ARGB
     values[1] = VideoColorKey;
@@ -99,12 +115,13 @@ static xcb_window_t VideoCreateWindow(xcb_window_t parent,
 	XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_EXPOSURE |
 	XCB_EVENT_MASK_STRUCTURE_NOTIFY;
     values[3] = VideoColormap;
+    values[4] = VideoBlankCursor;
     window = xcb_generate_id(Connection);
     xcb_create_window(Connection, depth, window, parent, VideoWindowX,
 	VideoWindowY, VideoWindowWidth, VideoWindowHeight, 0,
 	XCB_WINDOW_CLASS_INPUT_OUTPUT, visual,
 	XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK |
-	XCB_CW_COLORMAP, values);
+	XCB_CW_COLORMAP | XCB_CW_CURSOR, values);
 
     // define only available with xcb-utils-0.3.8
 #ifdef XCB_ICCCM_NUM_WM_SIZE_HINTS_ELEMENTS
@@ -130,28 +147,6 @@ static xcb_window_t VideoCreateWindow(xcb_window_t parent,
     values[1] = XCB_STACK_MODE_ABOVE;
     xcb_configure_window(Connection, window,
 	XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE, values);
-
-    xcb_map_window(Connection, window);
-
-    //
-    //	hide cursor
-    //
-    if (VideoBlankCursor == XCB_NONE) {
-	xcb_pixmap_t pixmap;
-	xcb_cursor_t cursor;
-
-	pixmap = xcb_generate_id(Connection);
-	xcb_create_pixmap(Connection, 1, pixmap, parent, 1, 1);
-	cursor = xcb_generate_id(Connection);
-	xcb_create_cursor(Connection, cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0,
-	    1, 1);
-	VideoBlankCursor = cursor;
-	VideoBlankTick = 0;
-    }
-
-    values[0] = VideoBlankCursor;
-    xcb_change_window_attributes(Connection, window, XCB_CW_CURSOR, values);
-    // FIXME: free colormap/cursor/pixmap needed?
 
     return window;
 }
@@ -470,6 +465,11 @@ void VideoPollEvents(int timeout)
     int n;
     int delay;
 
+    if (!Connection) {
+	Debug(3, "play: poll without connection\n");
+	return;
+    }
+
     fds[0].fd = xcb_get_file_descriptor(Connection);
     fds[0].events = POLLIN | POLLPRI;
 
@@ -636,12 +636,14 @@ int VideoInit(const char *display)
     VideoPlayWindow =
 	VideoCreateWindow(VideoScreen->root, VideoScreen->root_visual,
 	VideoScreen->root_depth);
+    xcb_map_window(Connection, VideoPlayWindow);
     VideoOsdWindow =
 	VideoCreateWindow(VideoPlayWindow, VideoScreen->root_visual,
 	VideoScreen->root_depth);
     Debug(3, "play: osd %x, play %x\n", VideoOsdWindow, VideoPlayWindow);
 
-    xcb_flush(Connection);
+    VideoWindowClear();
+    // done by clear: xcb_flush(Connection);
 
     return 0;
 }
@@ -663,6 +665,15 @@ void VideoExit(void)
 	xcb_free_colormap(Connection, VideoColormap);
 	VideoColormap = XCB_NONE;
     }
+    if (VideoBlankCursor != XCB_NONE) {
+	xcb_free_cursor(Connection, VideoBlankCursor);
+	VideoBlankCursor = XCB_NONE;
+    }
+    if (VideoPixmap != XCB_NONE) {
+	xcb_free_pixmap(Connection, VideoPixmap);
+	VideoPixmap = XCB_NONE;
+    }
+
     if (Connection) {
 	xcb_flush(Connection);
 	xcb_disconnect(Connection);

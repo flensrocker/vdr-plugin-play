@@ -11,7 +11,7 @@ if [ ${PV} == "9999" ] ; then
 		EGIT_REPO_URI="git://projects.vdr-developer.org/vdr-plugin-play.git"
 		KEYWORDS=""
 else
-		SRC_URI="mirror://vdr-developerorg/1005/${P}.tgz"
+		SRC_URI="mirror://vdr-developerorg/1010/${P}.tgz"
 		KEYWORDS="~x86 ~amd64"
 fi
 

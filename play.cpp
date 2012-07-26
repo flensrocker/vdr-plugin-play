@@ -42,7 +42,7 @@ extern "C"
     /// vdr-plugin version number.
     /// Makefile extracts the version number for generating the file name
     /// for the distribution archive.
-static const char *const VERSION = "0.0.10"
+static const char *const VERSION = "0.0.11"
 #ifdef GIT_REV
     "-GIT" GIT_REV
 #endif
@@ -340,7 +340,7 @@ extern "C"
 //////////////////////////////////////////////////////////////////////////////
 
 static pid_t PlayerPid;			///< player pid
-static char PipeBuf[4096];		///< pipe buffer
+static char PipeBuf[1024];		///< pipe buffer
 static int PipeCnt;			///< pipe buffer count
 static int PipeIdx;			///< pipe buffer index
 static int PipeOut[2];			///< player write pipe
@@ -369,6 +369,20 @@ void PlayerParseLine(const char *data, int size)
 	DvdNav = 2;
     } else if (!strncasecmp(data, "ID_DVD_VOLUME_ID=", 17)) {
 	Debug(3, "DVD_VOLUME = %s\n", data + 17);
+    } else if (!strncasecmp(data, "ID_AID_", 7)) {
+	char lang[64];
+	int aid;
+
+	if ( sscanf(data, "ID_AID_%d_LANG=%s", &aid, lang) == 2 ) {
+	    Debug(3, "AID(%d) = %s\n", aid, lang);
+	}
+    } else if (!strncasecmp(data, "ID_SID_", 7)) {
+	char lang[64];
+	int sid;
+
+	if ( sscanf(data, "ID_SID_%d_LANG=%s", &sid, lang) == 2 ) {
+	    Debug(3, "SID(%d) = %s\n", sid, lang);
+	}
     }
 }
 
@@ -390,7 +404,7 @@ void PollPipe(void)
 	case 0:			// timeout
 	    return;
 	case -1:			// error
-	    printf("player: poll failed: %s\n", strerror(errno));
+	    Error(tr("play/player: poll failed: %s\n"), strerror(errno));
 	    return;
 	default:			// ready
 	    break;
@@ -398,8 +412,8 @@ void PollPipe(void)
 
     // fill buffer
     if ((n = read(PipeOut[0], PipeBuf + PipeCnt,
-		sizeof(PipeBuf) - PipeCnt)) < 0) {
-	printf("player: read failed: %s\n", strerror(errno));
+	    sizeof(PipeBuf) - PipeCnt)) < 0) {
+	Error(tr("play/player: read failed: %s\n"), strerror(errno));
 	return;
     }
 
@@ -415,11 +429,18 @@ void PollPipe(void)
     }
 
     if (l) {				// remove consumed bytes
-	memmove(PipeBuf, PipeBuf + l, PipeCnt - l);
+	if ( PipeCnt - l ) {
+	    memmove(PipeBuf, PipeBuf + l, PipeCnt - l);
+	}
 	PipeCnt -= l;
 	PipeIdx -= l;
+    } else if (PipeCnt == sizeof(PipeBuf)) {
+	// no '\n' in buffer use it as single line
+	PipeBuf[sizeof(PipeBuf) - 1] = '\0';
+	PlayerParseLine(PipeBuf + PipeIdx, PipeCnt);
+	PipeIdx = 0;
+	PipeCnt = 0;
     }
-
 }
 
 /**
@@ -490,6 +511,7 @@ void ExecPlayer(const char *filename)
 	args[11] = "-noconsolecontrols";
 	args[12] = "-fixed-vo";
 	argn = 13;
+	// FIXME: dvd-device
 	if (!strncasecmp(filename, "cdda://", 7)) {
 	    args[argn++] = "-cache";	// cdrom needs cache
 	    args[argn++] = "1000";
@@ -615,26 +637,6 @@ int IsPlayerRunning(void)
 */
 static void SendCommand(const char *format, ...)
 {
-
-/*
- dvdnav up
- dvdnav down
- dvdnav left
- dvdnav right
- dvdnav menu
- dvdnav select
- dvdnav prev
- dvdnav mouse
- get_percent_pos
- get_time_length
- get_time_pos
- mute
- pause
- frame_step
- quit
- seek
- volume
-*/
     va_list va;
     char buf[256];
     int n;
@@ -1189,7 +1191,7 @@ bool cMyPlayer::GetReplayMode(bool & play, bool & forward, int &speed)
 {
     play = !PlayerPaused;
     forward = true;
-    speed = PlayerSpeed;
+    speed = play ? PlayerSpeed : -1;
     return true;
 }
 
@@ -1202,8 +1204,15 @@ void cMyPlayer::Action(void)
 {
     Debug(3, "play: player thread started\n");
     while (Running()) {
-	PollPipe();
-	VideoPollEvents(10);
+	if (ConfigUseSlave) {
+	    PollPipe();
+	    // FIXME: wait only if pipe not ready
+	}
+	if (ConfigOsdOverlay) {
+	    VideoPollEvents(10);
+	} else {
+	    usleep(10 * 1000);
+	}
     }
     Debug(3, "play: player thread stopped\n");
 }
@@ -1267,13 +1276,14 @@ class cMyControl:public cControl
     cMyPlayer * Player;			///< our player
     cSkinDisplayReplay *Display;	///< our osd display
     void ShowReplayMode(void);		///< display replay mode
+    void ShowProgress(void);		///< display progress bar
+    virtual void Show(void);		///< show replay control
+    virtual void Hide(void);		///< hide replay control
   public:
     cMyControl(const char *);
     virtual ~ cMyControl();
 
     virtual eOSState ProcessKey(eKeys);
-    virtual void Show(void);
-    virtual void Hide(void);
 
 };
 
@@ -1302,13 +1312,40 @@ void cMyControl::ShowReplayMode(void)
 }
 
 /**
+**	Show progress.
+*/
+void cMyControl::ShowProgress(void)
+{
+}
+
+/**
+**	Show control.
+*/
+void cMyControl::Show(void)
+{
+    Debug(3, "%s:\n", __FUNCTION__);
+    if (!Display) {
+	ShowProgress();
+    }
+}
+
+/**
 **	Control constructor.
+**
+**	@param filename	pathname of file to play.
 */
 cMyControl::cMyControl(const char *filename)
 :  cControl(Player = new cMyPlayer(filename))
 {
     Display = NULL;
     Status = new cMyStatus;		// start monitoring volume
+
+    //LastSkipKey = kNone;
+    //LastSkipSeconds = REPLAYCONTROLSKIPSECONDS;
+    //LastSkipTimeout.Set(0);
+    cStatus::MsgReplaying(this, filename, filename, true);
+
+    cDevice::PrimaryDevice()->ClrAvailableTracks(true);
 }
 
 /**
@@ -1322,8 +1359,9 @@ cMyControl::~cMyControl()
     delete Display;
     delete Status;
 
-    //Stop();
+    Hide();
     cStatus::MsgReplaying(this, NULL, NULL, false);
+    //Stop();
 }
 
 /**
@@ -1337,15 +1375,8 @@ void cMyControl::Hide(void)
 	delete Display;
 
 	Display = NULL;
+	SetNeedsFastResponse(false);
     }
-}
-
-/**
-**	Show control.
-*/
-void cMyControl::Show(void)
-{
-    Debug(3, "%s:\n", __FUNCTION__);
 }
 
 eOSState cMyControl::ProcessKey(eKeys key)
@@ -1358,13 +1389,9 @@ eOSState cMyControl::ProcessKey(eKeys key)
 	//Stop();
 	return osEnd;
     }
-    if (ConfigUseSlave) {
-	PollPipe();
-	VideoPollEvents(0);
-    }
     //state=cOsdMenu::ProcessKey(key);
     state = osContinue;
-    switch (key) {
+    switch ((int)key) {			// cast to shutup g++ warnings
 	case kUp:
 	    if (DvdNav) {
 		SendCommand("pausing_keep dvdnav up\n");
@@ -1387,17 +1414,25 @@ eOSState cMyControl::ProcessKey(eKeys key)
 		SendCommand("pausing_keep dvdnav down\n");
 		break;
 	    }
-	case kStop:
+	case kPause:
 	    PlayerSendPause();
 	    PlayerPaused ^= 1;
 	    ShowReplayMode();
 	    break;
 
+	case kFastRew|k_Release:
+	case kLeft|k_Release:
+	    if (Setup.MultiSpeedMode) {
+		break;
+	    }
+	    // FIXME:
+	    break;
 	case kLeft:
 	    if (DvdNav) {
 		SendCommand("pausing_keep dvdnav left\n");
 		break;
 	    }
+	case kFastRew:
 	    if (PlayerSpeed > 1) {
 		PlayerSendSetSpeed(PlayerSpeed /= 2);
 	    } else {
@@ -1410,17 +1445,74 @@ eOSState cMyControl::ProcessKey(eKeys key)
 		SendCommand("pausing_keep dvdnav right\n");
 		break;
 	    }
+	case kFastFwd:
 	    if (PlayerSpeed < 32) {
 		PlayerSendSetSpeed(PlayerSpeed *= 2);
 	    }
 	    ShowReplayMode();
 	    break;
 
+	case kRed:
+	    // FIXME: TimeSearch();
+	    break;
+
+#ifdef USE_JUMPINGSECONDS
+	case kGreen|k_Repeat:
+	    PlayerSendSeek(-Setup.JumpSecondsRepeat);
+	    break;
+	case kGreen:
+	    PlayerSendSeek(-Setup.JumpSeconds);
+	    break;
+	case k1|k_Repeat:
+	case k1:
+	    PlayerSendSeek(-Setup.JumpSecondsSlow);
+	    break;
+	case k3|k_Repeat:
+	case k3:
+	    PlayerSendSeek( Setup.JumpSecondsSlow);
+	    break;
+	case kYellow|k_Repeat:
+	    PlayerSendSeek(Setup.JumpSecondsRepeat);
+	    break;
+	case kYellow:
+	    PlayerSendSeek(Setup.JumpSeconds);
+	    break;
+#else
+	case kGreen|k_Repeat:
+	case kGreen:
+	    PlayerSendSeek(-60); 
+	    break;
+	case kYellow|k_Repeat:
+	case kYellow:
+	    PlayerSendSeek(+60);
+	    break;
+#endif /* JUMPINGSECONDS */
+#ifdef USE_LIEMIKUUTIO
+#ifndef USE_JUMPINGSECONDS
+	case k1|k_Repeat:
+	case k1:
+	    PlayerSendSeek(-20);
+	    break;
+	case k3|k_Repeat:
+	case k3:
+	    PlayerSendSeek(+20);
+	    break;
+#endif /* JUMPINGSECONDS */
+#endif
+
+	case kStop:
+	case kBlue:
+	    Hide();
+	    // FIXME: Stop();
+	    return osEnd;
+
 	case kOk:
 	    if (DvdNav) {
 		SendCommand("pausing_keep dvdnav select\n");
+		// FIXME: DvdNav = 0;
 		break;
 	    }
+	    // FIXME: full mode
 	    ShowReplayMode();
 	    break;
 
@@ -1440,6 +1532,17 @@ eOSState cMyControl::ProcessKey(eKeys key)
 		break;
 	    }
 	    break;
+
+	/* VDR: eats the keys
+	case kAudio:
+	    // FIXME: audio menu
+	    SendCommand("pausing_keep switch_audio\n");
+	    break;
+	case kSubtitles:
+	    // FIXME: subtitle menu
+	    SendCommand("pausing_keep sub_select\n");
+	    break;
+	*/
 
 	default:
 	    break;
